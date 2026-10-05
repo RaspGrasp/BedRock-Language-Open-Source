@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use crate::ast::{Statement, Expression};
 use std::collections::{HashMap, HashSet, BTreeMap};
 
@@ -218,7 +219,7 @@ _ => {}
         &self,
         current: &LiveInterval,
         active: &mut Vec<LiveInterval>,
-        free_regs: &mut Vec<usize>,
+        _free_regs: &mut Vec<usize>,
     ) {
         let expired: Vec<LiveInterval> = active
             .iter()
@@ -312,8 +313,8 @@ other => other,
 
         loop {
             match (ind_iter.peek().is_some(), dep_iter.peek().is_some()) {
-                (true, _) => { result.push(ind_iter.next().unwrap()); }
-                (false, true) => { result.push(dep_iter.next().unwrap()); }
+                (true, _) => { if let Some(s) = ind_iter.next() { result.push(s); } }
+                (false, true) => { if let Some(s) = dep_iter.next() { result.push(s); } }
                 (false, false) => break,
             }
         }

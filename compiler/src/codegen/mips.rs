@@ -1,7 +1,7 @@
 use crate::ast::{Statement, Expression, TypeKind};
 use crate::ir::{IrModule, IrOp, Operand};
 use crate::codegen::{Backend, SourceMapEntry};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 
 const BASE_ADDR: u32 = 0x80000000;
 
@@ -338,8 +338,8 @@ impl MipsBackend {
         }
 
     
-        for (i, instr) in module.instructions.iter().enumerate() {
-            if instr.op == IrOp::Mk {
+    for (i, instr) in module.instructions.iter().enumerate() {
+            if matches!(instr.op, IrOp::Mk | IrOp::Mf) {
                 if let Some(Operand::Label(name)) = instr.operands.first() {
                     self.labels.insert(name.clone(), i);
                 }
@@ -360,7 +360,7 @@ impl MipsBackend {
         match &instr.op {
 
            
-            IrOp::Mk => {
+           IrOp::Mk | IrOp::Mf => {
                 if let Some(Operand::Label(name)) = instr.operands.first() {
                     self.register_label(name);
                 }
@@ -473,8 +473,18 @@ IrOp::Rdf => {
                 let dst = self.dest_reg(&instr.operands[0]);
                 let l   = self.operand_to_reg(&instr.operands[1], 8);
                 let r   = self.operand_to_reg(&instr.operands[2], 9);
-                self.emit(0x0000001A | (l << 21) | (r << 16));  // DIV
+                self.emit(0x0000001B | (l << 21) | (r << 16));  // DIVU
                 self.emit(0x00000012 | (dst << 11));              // MFLO
+                self.writeback_if_spilled(&instr.operands[0], dst);
+            }
+
+            IrOp::Rem => {
+                if instr.operands.len() < 3 { return; }
+                let dst = self.dest_reg(&instr.operands[0]);
+                let l   = self.operand_to_reg(&instr.operands[1], 8);
+                let r   = self.operand_to_reg(&instr.operands[2], 9);
+                self.emit(0x0000001B | (l << 21) | (r << 16));  // DIVU
+                self.emit(0x00000010 | (dst << 11));              // MFHI (remainder)
                 self.writeback_if_spilled(&instr.operands[0], dst);
             }
 
@@ -714,7 +724,7 @@ IrOp::SaveCtx => {
                 }
             }
 
-            IrOp::Comment => {}
+            IrOp::Comment | IrOp::Syscall | IrOp::StrData => {}
         }
     }
 }
@@ -1145,7 +1155,7 @@ impl LegacyCodegen {
             }
             Expression::BinaryOp(l,op,r) => {
                 let lr=self.alloc_reg(); self.gen_expr(l,lr);
-                if (op=="<<" || op==">>") { if let Expression::Number(s,_)=r.as_ref() { let sa=(*s&31) as u32; if op=="<<" { self.emit(0x00000000|(lr<<16)|(dest<<11)|(sa<<6)); } else { self.emit(0x00000002|(lr<<16)|(dest<<11)|(sa<<6)); } self.free_reg(lr); return; } }
+                if op=="<<" || op==">>"  { if let Expression::Number(s,_)=r.as_ref() { let sa=(*s&31) as u32; if op=="<<" { self.emit(0x00000000|(lr<<16)|(dest<<11)|(sa<<6)); } else { self.emit(0x00000002|(lr<<16)|(dest<<11)|(sa<<6)); } self.free_reg(lr); return; } }
                 let rr=self.alloc_reg(); self.gen_expr(r,rr);
                 match op.as_str() {
                     "+" => self.emit(0x00000021|(lr<<21)|(rr<<16)|(dest<<11)),
@@ -1197,7 +1207,8 @@ impl LegacyCodegen {
                 else { let ba=*self.symbols.get(vn).unwrap_or(&0x80010000); let ar=self.alloc_reg(); self.emit_li(ar,ba+off); self.emit(0xAC000000|(ar<<21)|(vr<<16)); self.free_reg(ar); }
                 self.free_reg(vr);
             }
-           Expression::AddressOf(name) => {
+           Expression::Syscall(_) => {},
+            Expression::AddressOf(name) => {
                 if let Some(&idx) = self.functions.get(name) {
                     let abs = self.base_addr + (idx as u32 * 4);
                     self.emit_li(dest, abs);

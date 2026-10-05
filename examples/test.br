@@ -1,26 +1,50 @@
-root DATA_ADDR = 0x1000; // عنوان تخيلي للبيانات
+root BASE = 0x80000000;
+root DATA = 0x80010000;
+root STACK = 0x80020000;
 root VGA = 0xB8000;
 
-fn main() {
-    let key = 0xAA;
-    let i = 0;
-    
-    // مصفوفة بيانات وهمية لتشفيرها
-    let buffer = [72, 101, 108, 108, 111]; // كلمة "Hello"
-    
-    while (i < 5) {
-        let original = buffer[i];
-        
-        // عملية XOR بسيطة للتشفير
-        let encrypted = original ^ key; 
-        
-        // لو القيمة المشفرة أكبر من 100، ارسم نقطة بيضاء
-        if (encrypted > 100) {
-            poke(VGA + (i * 2), encrypted);
-        } else {
-            poke(VGA + (i * 2), 0x2E); // نقطة "."
-        }
-        
-        i = i + 1;
+// دالة حساب القيمة المطلقة
+fn abs(val) {
+    if (val < 0) {
+        return 0 - val;
     }
+    return val;
+}
+
+// دالة للبحث أو حساب مجموع تكراري مع شرط
+fn compute_sum(limit) {
+    let total = 0;
+    let n = 0;
+    while (n < limit) {
+        if (n == 7) {
+            // اختبار الخروج المبكر عند رقم معين
+            break;
+        }
+        if (n % 2 == 0) {
+            total = total + n;
+        } else {
+            total = total + (n * 2);
+        }
+        n = n + 1;
+    }
+    return total;
+}
+
+let base_val = -15;
+let positive_val = abs(base_val);
+
+let final_result = compute_sum(10);
+let combined = positive_val + final_result;
+
+// كتابة النتيجة النهائية في الـ VGA
+poke(VGA, combined);
+
+// مصفوفة أو تلاعب بالذاكرة عبر مؤشرات العناوين
+let ptr = DATA;
+let idx = 0;
+while (idx < 5) {
+    let val_to_store = idx * 100;
+    poke(ptr, val_to_store);
+    ptr = ptr + 4; // الانتقال للعنوان التالي (Word alignment)
+    idx = idx + 1;
 }

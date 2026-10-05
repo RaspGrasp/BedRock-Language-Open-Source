@@ -561,11 +561,8 @@ _ => {}
 
               
               Expression::AddressOf(name) => {
-                if !self.funcs.contains_key(name.as_str()) {
-                    self.errors.push(format!(
-                        "[VERIFIER] '&{}' refers to undefined function", name
-                    ));
-                } else if let Some(f) = self.funcs.get_mut(name) {
+                // may refer to a function or a data/string symbol — both OK
+                if let Some(f) = self.funcs.get_mut(name) {
                     f.used = true;
                 }
             }
@@ -580,7 +577,7 @@ _ => {}
             Expression::Variable(name)  => self.get_var_kind(name),
             Expression::BinaryOp(l, op, r) => {
                 match op.as_str() {
-                    "==" | "!=" | ">" | "<" | ">=" | "<=" => TypeKind::Bool,
+                    "==" | "!=" | ">" | "<" | ">=" | "<=" | "||" | "&&" => TypeKind::Bool,
                     _ => {
                         let lt = self.type_of_expr(l);
                         if lt != TypeKind::Unknown { lt } else { self.type_of_expr(r) }
@@ -642,7 +639,8 @@ _ => {}
 
     let funcs: Vec<(String, FuncInfo)> = self.funcs.clone().into_iter().collect();
     for (name, info) in &funcs {
-        if !info.used {
+        // main is the program entry point (IR builder calls it automatically)
+        if !info.used && name != "main" {
             self.warnings.push(format!(
                 "[VERIFIER] Function '{}' defined but never called", name
             ));

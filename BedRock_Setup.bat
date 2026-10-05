@@ -13,7 +13,7 @@ echo [BedRock] Configuration Script
 echo ------------------------------
 
 :: Locate bedrockc.exe
-set "TARGET_EXE=bedrockco.exe"
+set "TARGET_EXE=brc3.exe"
 set "FOUND_PATH="
 
 :: Check possible locations

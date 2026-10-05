@@ -1,9 +1,18 @@
-//RISC-V backedn
+//RISC-V backend
 use crate::ir::{IrModule, IrOp, Operand};
 use crate::codegen::{Backend, SourceMapEntry};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 const BASE_ADDR: u32 = 0x80000000;
+// Defaults below are only fallbacks for when the source doesn't declare
+// STACK/DATA explicitly. They carry no assumption about any specific chip —
+// any target (MIPS-style flat memory, ESP32-C3 split flash/SRAM, etc.)
+// overrides them via `root BASE`, `root STACK`, `root DATA` in source.
+const DEFAULT_STACK_OFFSET: u32 = 0x20000;
+const DEFAULT_DATA_OFFSET:  u32 = 0x10000;
+
+/// Minimum spill frame (bytes). Actual frame grows with register pressure.
+const MIN_SPILL_FRAME: i32 = 0x200; // default; grows if register pressure is higher
 
 const ZERO: u32 = 0;
 const RA:   u32 = 1;
@@ -72,12 +81,12 @@ fn j_type(imm: i32, rd: u32, opcode: u32) -> u32 {
 }
 
 
-fn nop() -> u32 { i_type(0, ZERO, 0x0, ZERO, OP_IMM) }            
-fn mv(rd: u32, rs: u32) -> u32 { i_type(0, rs, 0x0, rd, OP_IMM) }    
+fn nop() -> u32 { i_type(0, ZERO, 0x0, ZERO, OP_IMM) }
+fn mv(rd: u32, rs: u32) -> u32 { i_type(0, rs, 0x0, rd, OP_IMM) }
 fn addi(rd: u32, rs: u32, imm: i32) -> u32 { i_type(imm, rs, 0x0, rd, OP_IMM) }
 fn lw(rd: u32, base: u32, off: i32) -> u32 { i_type(off, base, 0x2, rd, OP_LOAD) }
 fn sw(rs2: u32, base: u32, off: i32) -> u32 { s_type(off, rs2, base, 0x2, OP_STORE) }
-fn jr(rs: u32) -> u32 { i_type(0, rs, 0x0, ZERO, OP_JALR) }         
+fn jr(rs: u32) -> u32 { i_type(0, rs, 0x0, ZERO, OP_JALR) }
 fn lui(rd: u32, imm20: u32) -> u32 { u_type(imm20, rd, OP_LUI) }
 fn xori(rd: u32, rs: u32, imm: i32) -> u32 { i_type(imm, rs, 0x4, rd, OP_IMM) }
 
@@ -126,19 +135,24 @@ impl RegAlloc {
 #[derive(Debug)]
 enum AllocResult {
     Reg(u32),
-    Spill(u32), 
+    Spill(u32),
 }
 
 
 enum PatchKind {
-    Jal { rd: u32 },                              
-    Branch { funct3: u32, rs1: u32, rs2: u32 },   
-    LuiAddi { rd: u32 },                           
+    Jal { rd: u32 },
+    Branch { funct3: u32, rs1: u32, rs2: u32 },
+    LuiAddi { rd: u32 },
 }
 
 
 pub struct RiscvBackend {
-    base_addr:    u32,
+    base_addr:    u32,   // where CODE is located/executed from
+    stack_addr:   u32,   // NEW: independent SP init value — never derived from base_addr
+    data_addr:    u32,   // where globals/root vars are stored — independent of base_addr and stack_addr
+    hosted:       bool,  // NEW: true when `root HOSTED = 1;` is present — the binary
+                         // is a callable function for a host (e.g. C/ESP-IDF), not a
+                         // freestanding program that owns the machine forever.
     code:         Vec<u32>,
     source_map:   Vec<SourceMapEntry>,
     current_line: usize,
@@ -149,8 +163,12 @@ pub struct RiscvBackend {
     cf_left:  Option<u32>,
     cf_right: Option<u32>,
 
-    alloc: RegAlloc,
+   alloc: RegAlloc,
 
+    pending_frame: bool,
+    frame_size:    i32,
+    frame_active:  bool,
+    arg_bytes:     u32,
     next_data:    u32,
     data_symbols: HashMap<String, u32>,
     root_vars:    HashSet<String>,
@@ -160,6 +178,9 @@ impl RiscvBackend {
     pub fn new() -> Self {
         RiscvBackend {
             base_addr:    BASE_ADDR,
+            stack_addr:   BASE_ADDR.wrapping_add(DEFAULT_STACK_OFFSET),
+            data_addr:    BASE_ADDR.wrapping_add(DEFAULT_DATA_OFFSET),
+            hosted:       false,
             code:         Vec::new(),
             source_map:   Vec::new(),
             current_line: 0,
@@ -167,14 +188,18 @@ impl RiscvBackend {
             label_patches: Vec::new(),
             cf_left:  None,
             cf_right: None,
-            alloc: RegAlloc::new(),
-            next_data:    BASE_ADDR + 0x10000,
+           alloc: RegAlloc::new(),
+            pending_frame: false,
+            frame_size:    MIN_SPILL_FRAME,
+            frame_active:  false,
+            arg_bytes:     0,
+            next_data:    BASE_ADDR.wrapping_add(DEFAULT_DATA_OFFSET),
             data_symbols: HashMap::new(),
             root_vars:    HashSet::new(),
         }
     }
 
-  
+
     fn emit(&mut self, instr: u32) {
         let addr = self.base_addr + (self.code.len() as u32 * 4);
         self.source_map.push(SourceMapEntry {
@@ -186,13 +211,35 @@ impl RiscvBackend {
         self.code.push(instr);
     }
 
+
+    fn compute_frame_size(&self) -> i32 {
+        let used = self.alloc.next_spill.saturating_sub(self.alloc.spill_base);
+        let need = (used as i32) + 0x20;
+        if need > MIN_SPILL_FRAME { ((need + 15) / 16) * 16 } else { MIN_SPILL_FRAME }
+    }
+
+    fn ensure_spill_frame(&mut self) {
+        if self.pending_frame {
+            self.frame_size = self.compute_frame_size();
+            self.emit(addi(SP, SP, -self.frame_size));
+            self.pending_frame = false;
+            self.frame_active = true;
+        }
+    }
+
+    fn leave_spill_frame(&mut self) {
+        if self.frame_active {
+            self.emit(addi(SP, SP, self.frame_size));
+            self.frame_active = false;
+        }
+    }
+
     fn patch(&mut self, idx: usize, instr: u32) {
         self.code[idx] = instr;
         self.source_map[idx].instruction = instr;
     }
 
-  
-  
+
     fn emit_li(&mut self, reg: u32, imm: u32) {
         let upper = imm.wrapping_add(0x800) >> 12;
         let lower = (imm as i32).wrapping_sub(((upper as i32) & 0xFFFFF) << 12);
@@ -208,10 +255,14 @@ impl RiscvBackend {
         self.base_addr + (index as u32 * 4)
     }
 
-   
-    fn operand_to_reg(&mut self, op: &Operand, temp_reg: u32) -> u32 {
+
+        fn operand_to_reg(&mut self, op: &Operand, temp_reg: u32) -> u32 {
         match op {
             Operand::VReg(name) => {
+              
+                if name == "__a0" {
+                    return A0;
+                }
                 if self.root_vars.contains(name) {
                     let addr = *self.data_symbols.get(name).unwrap_or(&0);
                     self.emit_li(temp_reg, addr);
@@ -238,9 +289,12 @@ impl RiscvBackend {
         }
     }
 
-    fn dest_reg(&mut self, op: &Operand) -> u32 {
+        fn dest_reg(&mut self, op: &Operand) -> u32 {
         match op {
             Operand::VReg(name) => {
+                if name == "__a0" {
+                    return A0;
+                }
                 if self.root_vars.contains(name) { return T0; }
                 match self.alloc.alloc(name) {
                     AllocResult::Reg(r) => r,
@@ -267,7 +321,7 @@ impl RiscvBackend {
         }
     }
 
-    
+
     fn register_label(&mut self, name: &str) {
         self.labels.insert(name.to_string(), self.code.len());
     }
@@ -311,7 +365,7 @@ impl RiscvBackend {
         self.label_patches.push((site, label.to_string(), PatchKind::Branch { funct3, rs1, rs2 }));
     }
 
-    
+
     fn emit_module(&mut self, module: &IrModule) {
         let mut used_as_label: HashSet<String> = HashSet::new();
         for instr in &module.instructions {
@@ -340,7 +394,7 @@ impl RiscvBackend {
         }
 
         for (i, instr) in module.instructions.iter().enumerate() {
-            if instr.op == IrOp::Mk {
+              if matches!(instr.op, IrOp::Mk | IrOp::Mf) {
                 if let Some(Operand::Label(name)) = instr.operands.first() {
                     self.labels.insert(name.clone(), i);
                 }
@@ -355,16 +409,57 @@ impl RiscvBackend {
         self.resolve_patches();
     }
 
-    fn emit_instr(&mut self, instr: &crate::ir::IrInstr) {
+      fn emit_instr(&mut self, instr: &crate::ir::IrInstr) {
+    
         match &instr.op {
-            IrOp::Mk => {
+            IrOp::Mk | IrOp::Mf | IrOp::Pop | IrOp::Comment | IrOp::Rdf | IrOp::StrData => {}
+            _ => self.ensure_spill_frame(),
+        }
+
+        match &instr.op {
+              
+           IrOp::Mk => {
                 if let Some(Operand::Label(name)) = instr.operands.first() {
                     self.register_label(name);
+                    if name.starts_with("main_entry") {
+                        self.leave_spill_frame();
+                        self.alloc.reset();
+                        self.pending_frame = true;
+                        self.frame_active  = false;
+                        self.arg_bytes = 0;
+                    }
+                }
+            }
+
+               IrOp::Mf => {
+                if let Some(Operand::Label(name)) = instr.operands.first() {
+                    self.leave_spill_frame();
+                    self.register_label(name);
+                    self.alloc.reset();
+                    self.pending_frame = true;
+                    self.frame_active  = false;
+                    self.arg_bytes = 0;
                 }
             }
 
             IrOp::Halt => {
-                self.emit(j_type(0, ZERO, OP_JAL)); 
+                if self.hosted {
+                    // Hosted mode: give the host's sp/gp back exactly as
+                    // they were, then do a REAL return — never trap the
+                    // host in an infinite loop or leave its stack pointer
+                    // clobbered by our own stack/RA regions.
+                    let save_sp_addr = self.stack_addr.wrapping_add(0x1000);
+                    let save_gp_addr = self.stack_addr.wrapping_add(0x1004);
+                    self.emit_li(T0, save_sp_addr);
+                    self.emit(lw(SP, T0, 0));
+                    self.emit_li(T0, save_gp_addr);
+                    self.emit(lw(GP, T0, 0));
+                    self.emit(jr(RA));
+                } else {
+                    // Freestanding mode (unchanged): we own the machine
+                    // forever, so an infinite loop is the correct "end".
+                    self.emit(j_type(0, ZERO, OP_JAL));
+                }
             }
 
             IrOp::Mov => {
@@ -452,7 +547,18 @@ impl RiscvBackend {
                 let dst = self.dest_reg(&instr.operands[0]);
                 let l   = self.operand_to_reg(&instr.operands[1], T1);
                 let r   = self.operand_to_reg(&instr.operands[2], T2);
-                self.emit(r_type(0x01, r, l, 0x4, dst, OP_REG)); // DIV
+                // DIVU: unsigned division (language defaults to u32)
+                self.emit(r_type(0x01, r, l, 0x5, dst, OP_REG));
+                self.writeback_if_spilled(&instr.operands[0], dst);
+            }
+
+            IrOp::Rem => {
+                if instr.operands.len() < 3 { return; }
+                let dst = self.dest_reg(&instr.operands[0]);
+                let l   = self.operand_to_reg(&instr.operands[1], T1);
+                let r   = self.operand_to_reg(&instr.operands[2], T2);
+                // REMU: unsigned remainder
+                self.emit(r_type(0x01, r, l, 0x7, dst, OP_REG));
                 self.writeback_if_spilled(&instr.operands[0], dst);
             }
 
@@ -491,6 +597,9 @@ impl RiscvBackend {
                 self.emit(xori(dst, src, -1)); // bitwise NOT
                 self.writeback_if_spilled(&instr.operands[0], dst);
             }
+            IrOp::Syscall | IrOp::StrData => {
+                // OS syscalls are x86-hosted only for now
+            }
 
             IrOp::Cf => {
                 if instr.operands.len() < 2 { return; }
@@ -509,12 +618,15 @@ impl RiscvBackend {
                 let l = self.cf_left.unwrap_or(CF_L);
                 let r = self.cf_right.unwrap_or(CF_R);
                 match cond.as_str() {
-                    "==" => self.emit_branch_patch(0x0, l, r, &label),  
-                    "!=" => self.emit_branch_patch(0x1, l, r, &label),  
-                    "<"  => self.emit_branch_patch(0x4, l, r, &label), 
-                    ">=" => self.emit_branch_patch(0x5, l, r, &label),  
-                    ">"  => self.emit_branch_patch(0x4, r, l, &label),  
-                    "<=" => self.emit_branch_patch(0x5, r, l, &label),  
+                    // equality
+                    "==" => self.emit_branch_patch(0x0, l, r, &label),
+                    "!=" => self.emit_branch_patch(0x1, l, r, &label),
+                    // signed compares: works with two's-complement unary minus
+                    // (e.g. -5 < 0 is true). Use u32 addresses carefully.
+                    "<"  => self.emit_branch_patch(0x4, l, r, &label), // BLT
+                    ">=" => self.emit_branch_patch(0x5, l, r, &label), // BGE
+                    ">"  => self.emit_branch_patch(0x4, r, l, &label),
+                    "<=" => self.emit_branch_patch(0x5, r, l, &label),
                     _ => {
                         eprintln!("[RISCV IR] Unknown JF condition: '{}'", cond);
                         self.emit_branch_patch(0x1, l, r, &label);
@@ -524,7 +636,7 @@ impl RiscvBackend {
 
             IrOp::Go => {
                 if let Some(Operand::Label(label)) = instr.operands.first() {
-                    self.emit_jal_patch(ZERO, label); 
+                    self.emit_jal_patch(ZERO, label);
                 }
             }
 
@@ -533,6 +645,7 @@ impl RiscvBackend {
                 let src = self.operand_to_reg(&instr.operands[0], T1);
                 self.emit(addi(SP, SP, -4));
                 self.emit(sw(src, SP, 0));
+                self.arg_bytes = self.arg_bytes.saturating_add(4);
             }
 
             IrOp::Pop => {
@@ -543,20 +656,45 @@ impl RiscvBackend {
                 self.writeback_if_spilled(&instr.operands[0], dst);
             }
 
-            IrOp::Cal => {
+           IrOp::Cal => {
                 if let Some(Operand::Label(label)) = instr.operands.first() {
                     if label.is_empty() { return; }
-                    self.emit(mv(SCR1, RA));           
-                    self.emit_jal_patch(RA, label);   
-                    self.emit(mv(RA, SCR1));           
+
+                    let adj = self.arg_bytes as i32;
+
+                    let mut saved: Vec<(u32, i32)> = Vec::new();
+                    let mut used = HashSet::new();
+                    let mut off: i32 = 0x40;
+                    for &reg in self.alloc.map.values() {
+                        if used.insert(reg) {
+                            saved.push((reg, off));
+                            off += 4;
+                        }
+                    }
+                    for &(reg, o) in &saved {
+                        self.emit(sw(reg, SP, o));
+                    }
+
+                    self.emit(addi(GP, GP, -4));
+                    self.emit(sw(RA, GP, 0));
+                    self.emit_jal_patch(RA, label);
+                    self.emit(lw(RA, GP, 0));
+                    self.emit(addi(GP, GP, 4));
+
+                    for &(reg, o) in &saved {
+                        self.emit(lw(reg, SP, o - adj));
+                    }
+
+                    self.arg_bytes = 0;
                 }
             }
 
-            IrOp::Ret => {
+               IrOp::Ret => {
                 if let Some(op) = instr.operands.first() {
                     let src = self.operand_to_reg(op, A0);
                     if src != A0 { self.emit(mv(A0, src)); }
                 }
+                self.leave_spill_frame();
                 self.emit(jr(RA));
             }
 
@@ -564,8 +702,8 @@ impl RiscvBackend {
                 if instr.operands.len() < 2 { return; }
                 if let Operand::Label(handler) = &instr.operands[1] {
                     let site = self.code.len();
-                    self.emit(0); 
-                    self.emit(0); 
+                    self.emit(0);
+                    self.emit(0);
                     self.label_patches.push((site, handler.clone(), PatchKind::LuiAddi { rd: SCR1 }));
                 }
             }
@@ -602,7 +740,6 @@ impl RiscvBackend {
             IrOp::Bnw => {}
 
             IrOp::IntDisable => {
-               
                 let csr_mstatus: i32 = 0x300;
                 self.emit(i_type(csr_mstatus, 0x8, 0x7, ZERO, OP_SYSTEM));
             }
@@ -644,36 +781,64 @@ impl Backend for RiscvBackend {
         self.labels.clear();
         self.label_patches.clear();
         self.alloc.reset();
+        self.pending_frame = false;
+        self.frame_active  = false;
         self.cf_left  = None;
         self.cf_right = None;
         self.root_vars.clear();
         self.data_symbols.clear();
-        self.next_data = BASE_ADDR + 0x10000;
+        self.hosted = false;
 
+        // Reset to defaults; each is independently overridable below.
+        self.stack_addr = self.base_addr.wrapping_add(DEFAULT_STACK_OFFSET);
+        self.data_addr  = self.base_addr.wrapping_add(DEFAULT_DATA_OFFSET);
+
+        // First pass: let the SOURCE decide every address explicitly.
+        // No chip is assumed here — BASE/STACK/DATA are independent knobs.
         for instr in &module.instructions {
             if instr.op == IrOp::Rdf {
                 if let (Some(Operand::VReg(name)), Some(Operand::Imm(val))) =
                     (instr.operands.get(0), instr.operands.get(1))
                 {
                     match name.as_str() {
-                        "BASE"  => self.base_addr = *val as u32,
-                        "STACK" => self.next_data = *val as u32,
-                        "DATA"  => self.next_data = *val as u32,
+                        "BASE"   => self.base_addr  = *val as u32,
+                        "STACK"  => self.stack_addr = *val as u32,  // now drives SP directly
+                        "DATA"   => self.data_addr  = *val as u32,  // now independent of STACK
+                        "HOSTED" => self.hosted = *val != 0,        // NEW: opt into hosted mode
                         _ => {}
                     }
                 }
             }
         }
+        self.next_data = self.data_addr;
 
-        
-        self.emit_li(GP, self.base_addr.wrapping_add(0x30000));
+        // GP now serves as a dedicated return-address stack, kept far
+        // away from SP's region (arguments/spills) so the two can never
+        // collide for any realistic program size.
+        let ra_stack_addr = self.stack_addr.wrapping_add(0x2000);
+
+        if self.hosted {
+            // We are being called as a FUNCTION from an existing host
+            // (e.g. C/ESP-IDF) that already has its own valid sp/gp and
+            // expects us to give them back unharmed on return. Save the
+            // host's sp/gp into fixed slots reserved well away from our
+            // own stack/data/RA regions before we touch either register.
+            let save_sp_addr = self.stack_addr.wrapping_add(0x1000);
+            let save_gp_addr = self.stack_addr.wrapping_add(0x1004);
+            self.emit_li(T0, save_sp_addr);
+            self.emit(sw(SP, T0, 0));
+            self.emit_li(T0, save_gp_addr);
+            self.emit(sw(GP, T0, 0));
+        }
+
+        self.emit_li(GP, ra_stack_addr);
         self.emit(nop());
-        self.emit_li(SP, self.base_addr.wrapping_add(0x20000)); 
+        self.emit_li(SP, self.stack_addr);
 
         self.emit_module(module);
 
         self.code.iter()
-            .flat_map(|&w| w.to_le_bytes().to_vec())   
+            .flat_map(|&w| w.to_le_bytes().to_vec())
             .collect()
     }
 

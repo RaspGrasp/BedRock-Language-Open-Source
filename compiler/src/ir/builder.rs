@@ -18,7 +18,7 @@ impl IrBuilder {
         }
     }
 
-   pub fn build(&mut self, program: Vec<Statement>) -> IrModule {
+      pub fn build(&mut self, program: Vec<Statement>) -> IrModule {
     let mut module = IrModule::new();
 
     for stmt in &program {
@@ -41,8 +41,7 @@ impl IrBuilder {
             Statement::FunctionDefine(_, _, _, _) | Statement::IntHandler(_, _) => {
                 funcs.push(stmt);
             }
-            Statement::Let(_, _, _)
-            | Statement::Root(_, _, _)
+            Statement::Root(_, _, _)
             | Statement::ArrayDefine(_, _, _)
             | Statement::StringDefine(_, _)
             | Statement::StructDefine(_, _)
@@ -55,18 +54,33 @@ impl IrBuilder {
         }
     }
 
+
+    let has_main = funcs.iter().any(|s| {
+        matches!(s, Statement::FunctionDefine(name, _, _, _) if name == "main")
+    });
+
+    // 1) globals / roots
     for stmt in &header {
         self.lower_stmt(stmt, &mut module);
     }
 
-    let main_label = self.fresh_label("main_entry");
-    module.push(IrInstr::go(&main_label));
+
+    let start_label = self.fresh_label("main_entry");
+    module.push(IrInstr::go(&start_label));
+
 
     for stmt in &funcs {
         self.lower_stmt(stmt, &mut module);
     }
 
-    module.push(IrInstr::mk(&main_label));
+
+    module.push(IrInstr::mk(&start_label));
+
+
+    if has_main {
+        module.push(IrInstr::cal("main"));
+    }
+
 
     for stmt in &entry {
         self.lower_stmt(stmt, &mut module);
@@ -75,7 +89,6 @@ impl IrBuilder {
     module.push(IrInstr::halt());
     module
 }
-
     fn fresh_vreg(&mut self) -> Operand {
         let n = self.vreg_counter;
         self.vreg_counter += 1;
@@ -121,10 +134,11 @@ impl IrBuilder {
             }
 
             Statement::StringDefine(name, s) => {
-                for (i, byte) in s.bytes().enumerate() {
-                    out.push(IrInstr::df(&format!("{}__{}", name, i), byte as u64));
-                }
-                out.push(IrInstr::df(&format!("{}__null", name), 0));
+                // One contiguous string in rodata; symbol `name` points to first byte
+                out.push(IrInstr::new(
+                    IrOp::StrData,
+                    vec![Operand::Label(name.clone()), Operand::Str(s.clone())],
+                ));
             }
 
             Statement::Poke(addr_expr, val_expr) => {
@@ -138,14 +152,22 @@ impl IrBuilder {
                 let val  = self.lower_expr(val_expr, out);
                 out.push(IrInstr::new(IrOp::Outb, vec![val, port]));
             }
-
-           Statement::FunctionDefine(name, params, body, _) => {
-                out.push(IrInstr::mk(name));
+                       
+            Statement::FunctionDefine(name, params, body, _) => {
+                out.push(IrInstr::mf(name));
                 for (pname, _) in params {
                     out.push(IrInstr::pop(Operand::VReg(pname.clone())));
                 }
                 for s in body {
                     self.lower_stmt(s, out);
+                }
+              
+                let ends_with_ret = matches!(
+                    body.last(),
+                    Some(Statement::Return(_))
+                );
+                if !ends_with_ret {
+                    out.push(IrInstr::ret());
                 }
             }
 
@@ -228,8 +250,8 @@ impl IrBuilder {
                 }
             }
 
-            Statement::IntHandler(name, body) => {
-                out.push(IrInstr::mk(name));
+              Statement::IntHandler(name, body) => {
+                out.push(IrInstr::mf(name));
                 for s in body {
                     self.lower_stmt(s, out);
                 }
@@ -282,6 +304,14 @@ impl IrBuilder {
             Expression::Variable(name) => Operand::VReg(name.clone()),
 
             Expression::BinaryOp(lhs, op, rhs) => {
+                // short-circuit logical operators
+                if op == "||" {
+                    return self.lower_or_sc(lhs, rhs, out);
+                }
+                if op == "&&" {
+                    return self.lower_and_sc(lhs, rhs, out);
+                }
+
                 let l = self.lower_expr(lhs, out);
                 let r = self.lower_expr(rhs, out);
                 let dest = self.fresh_vreg();
@@ -290,6 +320,7 @@ impl IrBuilder {
                     "-"  => IrInstr::sub(dest.clone(), l, r),
                     "*"  => IrInstr::mul(dest.clone(), l, r),
                     "/"  => IrInstr::div(dest.clone(), l, r),
+                    "%"  => IrInstr::rem(dest.clone(), l, r),
                     "&"  => IrInstr::and(dest.clone(), l, r),
                     "|"  => IrInstr::orr(dest.clone(), l, r),
                     "^"  => IrInstr::xor(dest.clone(), l, r),
@@ -330,10 +361,13 @@ impl IrBuilder {
                 dest
             }
 
-            Expression::Call(name, args) => {
+           Expression::Call(name, args) => {
                 self.lower_call(name, args, out);
                 let result = self.fresh_vreg();
-                out.push(IrInstr::pop(result.clone()));
+                out.push(IrInstr::mov(
+                    result.clone(),
+                    Operand::VReg("__a0".to_string()),
+                ));
                 result
             }
            Expression::FieldAccess(var, field) => {
@@ -355,6 +389,18 @@ impl IrBuilder {
                 Operand::Label(name.clone())
             }
 
+            Expression::Syscall(args) => {
+                let mut ops = Vec::new();
+                for a in args {
+                    ops.push(self.lower_expr(a, out));
+                }
+                let dest = self.fresh_vreg();
+                let mut all = vec![dest.clone()];
+                all.extend(ops);
+                out.push(IrInstr::new(IrOp::Syscall, all));
+                dest
+            }
+
             Expression::WaitKey => {
                 let dest = self.fresh_vreg();
                 out.push(IrInstr::get(
@@ -367,9 +413,14 @@ impl IrBuilder {
     }
 
     fn lower_call(&mut self, name: &str, args: &[Expression], out: &mut IrModule) {
-        for arg in args.iter().rev() {
-            let op = self.lower_expr(arg, out);
-            out.push(IrInstr::psh(op));
+        // Evaluate ALL arguments first (including nested calls), then push.
+        // Avoids interleaving outer pushes with inner call frames on the stack.
+        let mut ops = Vec::new();
+        for arg in args {
+            ops.push(self.lower_expr(arg, out));
+        }
+        for op in ops.iter().rev() {
+            out.push(IrInstr::psh(op.clone()));
         }
         out.push(IrInstr::cal(name));
     }
@@ -380,17 +431,65 @@ impl IrBuilder {
         out: &mut IrModule,
     ) -> (IrInstr, String) {
         match expr {
-            Expression::BinaryOp(lhs, op, rhs) => {
+            Expression::BinaryOp(lhs, op, rhs)
+                if matches!(op.as_str(), "==" | "!=" | "<" | ">" | "<=" | ">=") =>
+            {
                 let l   = self.lower_expr(lhs, out);
                 let r   = self.lower_expr(rhs, out);
                 let inv = invert_cond(op);
                 (IrInstr::cf(l, r), inv)
             }
             other => {
+                // ||, &&, arithmetic, variables, etc. → evaluate then test != 0
                 let val = self.lower_expr(other, out);
                 (IrInstr::cf(val, Operand::Imm(0)), "==".to_string())
             }
         }
+    }
+
+
+    // a || b  →  if a != 0 then 1 else (b != 0)
+    fn lower_or_sc(&mut self, lhs: &Expression, rhs: &Expression, out: &mut IrModule) -> Operand {
+        let dest = self.fresh_vreg();
+        let true_lbl = self.fresh_label("or_true");
+        let end_lbl  = self.fresh_label("or_end");
+
+        let l = self.lower_expr(lhs, out);
+        out.push(IrInstr::cf(l, Operand::Imm(0)));
+        out.push(IrInstr::jf("!=", &true_lbl)); // if l != 0 → true
+
+        let r = self.lower_expr(rhs, out);
+        out.push(IrInstr::cf(r, Operand::Imm(0)));
+        out.push(IrInstr::jf("!=", &true_lbl)); // if r != 0 → true
+
+        out.push(IrInstr::mov(dest.clone(), Operand::Imm(0)));
+        out.push(IrInstr::go(&end_lbl));
+        out.push(IrInstr::mk(&true_lbl));
+        out.push(IrInstr::mov(dest.clone(), Operand::Imm(1)));
+        out.push(IrInstr::mk(&end_lbl));
+        dest
+    }
+
+    // a && b  →  if a == 0 then 0 else (b != 0)
+    fn lower_and_sc(&mut self, lhs: &Expression, rhs: &Expression, out: &mut IrModule) -> Operand {
+        let dest = self.fresh_vreg();
+        let false_lbl = self.fresh_label("and_false");
+        let end_lbl   = self.fresh_label("and_end");
+
+        let l = self.lower_expr(lhs, out);
+        out.push(IrInstr::cf(l, Operand::Imm(0)));
+        out.push(IrInstr::jf("==", &false_lbl)); // if l == 0 → false
+
+        let r = self.lower_expr(rhs, out);
+        out.push(IrInstr::cf(r, Operand::Imm(0)));
+        out.push(IrInstr::jf("==", &false_lbl)); // if r == 0 → false
+
+        out.push(IrInstr::mov(dest.clone(), Operand::Imm(1)));
+        out.push(IrInstr::go(&end_lbl));
+        out.push(IrInstr::mk(&false_lbl));
+        out.push(IrInstr::mov(dest.clone(), Operand::Imm(0)));
+        out.push(IrInstr::mk(&end_lbl));
+        dest
     }
 
     fn lower_comparison(

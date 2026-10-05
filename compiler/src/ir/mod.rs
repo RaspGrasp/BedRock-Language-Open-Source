@@ -1,15 +1,16 @@
+#![allow(dead_code)]
 pub mod builder;
 
 // ── IrOp ─────────────────────────────────────────────────
 #[derive(Debug, Clone, PartialEq)]
 pub enum IrOp {
-    Mov, Bri, Cal, Ret, Mk, Halt, Asm,
-    Add, Sub, Mul, Div,
+    Mov, Bri, Cal, Ret, Mk, Mf, Halt, Asm,
+    Add, Sub, Mul, Div, Rem,
     And, Orr, Xor, Not, Shl, Shr,
     Cf, Jf, Go,
     Psh, Pop, Get, Df,
-    Int, Inb, Outb, Poke, Peek,
-Const, Bnw, IntDisable, SaveCtx, RestoreCtx, Rdf,
+    Int, Inb, Outb, Poke, Peek, Syscall,
+Const, Bnw, IntDisable, SaveCtx, RestoreCtx, Rdf, StrData,
 Comment,
 }
 
@@ -46,6 +47,8 @@ impl IrInstr {
     pub fn ret_val(val: Operand) -> Self { IrInstr::new(IrOp::Ret, vec![val]) }
 
     pub fn mk(name: &str)  -> Self { IrInstr::new(IrOp::Mk,  vec![Operand::Label(name.to_string())]) }
+
+    pub fn mf(name: &str)  -> Self { IrInstr::new(IrOp::Mf,  vec![Operand::Label(name.to_string())]) }
     pub fn go(label: &str) -> Self { IrInstr::new(IrOp::Go,  vec![Operand::Label(label.to_string())]) }
     pub fn jf(cond: &str, label: &str) -> Self {
         IrInstr::new(IrOp::Jf, vec![Operand::Str(cond.to_string()), Operand::Label(label.to_string())])
@@ -68,6 +71,7 @@ impl IrInstr {
     pub fn sub(dst: Operand, l: Operand, r: Operand) -> Self { IrInstr::new(IrOp::Sub, vec![dst, l, r]) }
     pub fn mul(dst: Operand, l: Operand, r: Operand) -> Self { IrInstr::new(IrOp::Mul, vec![dst, l, r]) }
     pub fn div(dst: Operand, l: Operand, r: Operand) -> Self { IrInstr::new(IrOp::Div, vec![dst, l, r]) }
+    pub fn rem(dst: Operand, l: Operand, r: Operand) -> Self { IrInstr::new(IrOp::Rem, vec![dst, l, r]) }
     pub fn and(dst: Operand, l: Operand, r: Operand) -> Self { IrInstr::new(IrOp::And, vec![dst, l, r]) }
     pub fn orr(dst: Operand, l: Operand, r: Operand) -> Self { IrInstr::new(IrOp::Orr, vec![dst, l, r]) }
     pub fn xor(dst: Operand, l: Operand, r: Operand) -> Self { IrInstr::new(IrOp::Xor, vec![dst, l, r]) }
@@ -91,6 +95,7 @@ impl std::fmt::Display for IrInstr {
         let ops: Vec<String> = self.operands.iter().map(fmt_op).collect();
         match &self.op {
             IrOp::Mk => write!(f, "{}:{}", ops.join(""), cmt),
+            IrOp::Mf => write!(f, "Mf {}{}", ops.join(""), cmt),
             _        => write!(f, "{:?} {}{}", self.op, ops.join(", "), cmt),
         }
     }

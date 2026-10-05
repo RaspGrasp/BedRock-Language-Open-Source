@@ -1,6 +1,6 @@
 #!/bin/bash
 
-BINARY_NAME="bedrockco"
+BINARY_NAME="brc3"
 INSTALL_DIR="/usr/local/bin"
 ICON_NAME="bedrock-icon.png"
 

@@ -95,11 +95,7 @@ impl TypeInferencer {
                     params: params.iter().map(|(_, k)| {
                         if *k == TypeKind::Unknown { TypeKind::U32 } else { k.clone() }
                     }).collect(),
-                    return_type: if *return_type == TypeKind::Unknown {
-                        TypeKind::U32
-                    } else {
-                        return_type.clone()
-                    },
+                    return_type: return_type.clone(), // Unknown = void (no return required)
                 };
                 self.env.set_func(name, sig);
             }
@@ -170,11 +166,8 @@ impl TypeInferencer {
             }
 
             Statement::FunctionDefine(name, params, body, return_type) => {
-                let final_return = if return_type == TypeKind::Unknown {
-                    TypeKind::U32
-                } else {
-                    return_type
-                };
+                // Unknown return type means void — do not default to u32
+                let final_return = return_type;
 
                 // resolve param types
                 let resolved_params: Vec<(String, TypeKind)> = params
@@ -342,6 +335,10 @@ impl TypeInferencer {
             }
             Expression::AddressOf(name) => {
                 Expression::AddressOf(name)
+            }
+            Expression::Syscall(args) => {
+                let inferred: Vec<_> = args.into_iter().map(|a| self.infer_expr(a)).collect();
+                Expression::Syscall(inferred)
             }
 
             Expression::BinaryOp(left, op, right) => {

@@ -86,4 +86,5 @@ pub enum Expression {
     FieldAccess(String, String),
     FieldAssign(String, String, Box<Expression>),
     AddressOf(String),
+    Syscall(Vec<Expression>),
 }

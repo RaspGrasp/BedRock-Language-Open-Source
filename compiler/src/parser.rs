@@ -3,13 +3,47 @@
 
     pub struct Parser { 
         tokens: Vec<Token>, 
-        pos: usize 
+        locs: Vec<(usize, usize)>,
+        pos: usize,
+        errors: Vec<String>,
     }
 
     impl Parser {
-        pub fn new(tokens: Vec<Token>) -> Self { 
+        pub fn new(tokens: Vec<Token>) -> Self {
+            let n = tokens.len();
+            Self::new_with_locs(tokens, vec![(1, 1); n])
+        }
+
+        pub fn new_with_locs(tokens: Vec<Token>, locs: Vec<(usize, usize)>) -> Self { 
             eprintln!("[INFO] Parser initialized with {} tokens", tokens.len());
-            Parser { tokens, pos: 0 } 
+            let locs = if locs.len() == tokens.len() { locs } else { vec![(1usize, 1usize); tokens.len()] };
+            Parser { tokens, locs, pos: 0, errors: Vec::new() } 
+        }
+
+        pub fn take_errors(&mut self) -> Vec<String> {
+            std::mem::take(&mut self.errors)
+        }
+
+        fn loc(&self) -> (usize, usize) {
+            if self.pos < self.locs.len() { self.locs[self.pos] } else if !self.locs.is_empty() { *self.locs.last().unwrap() } else { (1, 1) }
+        }
+
+        fn error(&mut self, msg: &str) {
+            let (line, col) = self.loc();
+            let full = format!("[PARSER ERROR] line {}:{}: {}", line, col, msg);
+            eprintln!("{}", full);
+            self.errors.push(full);
+        }
+
+        /// Skip tokens until ';' or '}' to allow limited recovery
+        fn synchronize(&mut self) {
+            while !self.is_at_end() {
+                match self.peek() {
+                    Token::SemiColon => { self.advance(); return; }
+                    Token::RBrace => { return; }
+                    _ => { self.advance(); }
+                }
+            }
         }
 
     fn peek_token(&self) -> Option<Token> {
@@ -32,11 +66,15 @@
             Token::Minus => "-".to_string(),
             Token::Star => "*".to_string(),
             Token::Slash => "/".to_string(),
+            Token::Percent => "%".to_string(),
             Token::Ampersand => "&".to_string(),
             Token::ShiftLeft => "<<".to_string(),
             Token::ShiftRight => ">>".to_string(),
             Token::Pipe => "|".to_string(),
             Token::Caret => "^".to_string(),
+            Token::AndAnd => "&&".to_string(),
+            Token::OrOr => "||".to_string(),
+            Token::Bang => "!".to_string(),
             _ => "".to_string(),
         }
     }
@@ -66,7 +104,19 @@
         pub fn parse_program(&mut self) -> Vec<Statement> {
     let mut stmts = Vec::new();
     while !self.is_at_end() {
-        stmts.push(self.parse_statement());
+        let before = self.pos;
+        let stmt = self.parse_statement();
+        stmts.push(stmt);
+        // prevent infinite loop on recovery failure
+        if self.pos == before && !self.is_at_end() {
+            self.error("stuck while parsing — skipping token");
+            self.advance();
+        }
+    }
+    if !self.errors.is_empty() {
+        eprintln!("-------------------------------------------");
+        eprintln!("[PARSER] {} error(s) — compilation aborted", self.errors.len());
+        std::process::exit(1);
     }
     stmts
 }
@@ -91,6 +141,13 @@
         if self.match_token(Token::Return) { return self.return_statement(); }
         if self.match_token(Token::Outb) { return self.outb_stmt(); }
         if self.match_token(Token::Poke) { return self.poke_stmt(); }
+        if self.check(Token::Syscall) {
+            let e = self.parse_expression();
+            self.consume(Token::SemiColon);
+            // encode as: let __discard = syscall(...);
+            return Statement::Let("__sys".into(), e, TypeKind::Unknown);
+        }
+
         if self.match_token(Token::Asm) { return self.asm_stmt(); }
         if self.match_token(Token::Call) { return self.callptr_stmt(); }
         if self.match_token(Token::Struct) { return self.parse_struct(); }
@@ -128,7 +185,7 @@ if self.match_token(Token::Bnw) {
 
             if self.match_token(Token::Dot) {
     let field = if let Token::Identifier(f) = self.advance() { f } else {
-        eprintln!("[PARSER ERROR] Expected field name after '.'");
+        self.error("Expected field name after '.'");
         std::process::exit(1);
     };
     self.consume(Token::Equal);
@@ -176,7 +233,7 @@ if self.match_token(Token::Bnw) {
         }
         let k = self.parse_type();
         if k == TypeKind::Unknown {
-            eprintln!("[PARSER ERROR] Expected type after '@'");
+            self.error("Expected type after '@'");
             std::process::exit(1);
         }
         k
@@ -194,7 +251,7 @@ if self.match_token(Token::Bnw) {
             if let Token::Number(num) = self.advance() {
                 vals.push(num);
             } else {
-                eprintln!("[PARSER ERROR] Expected number in array literal");
+                self.error("Expected number in array literal");
                 std::process::exit(1);
             }
             if !self.match_token(Token::Comma) { break; }
@@ -250,7 +307,7 @@ if self.match_token(Token::Bnw) {
     let name = if let Token::Identifier(s) = self.advance() {
         s
     } else {
-        eprintln!("[PARSER ERROR] Expected function name after 'fn'");
+        self.error("Expected function name after 'fn'");
         std::process::exit(1);
     };
 
@@ -262,7 +319,7 @@ if self.match_token(Token::Bnw) {
             let pname = if let Token::Identifier(p) = self.advance() {
                 p
             } else {
-                eprintln!("[PARSER ERROR] Expected parameter name");
+                self.error("Expected parameter name");
                 std::process::exit(1);
             };
 
@@ -295,16 +352,36 @@ if self.match_token(Token::Bnw) {
     Statement::FunctionDefine(name, params, body, return_type)
 }
    
+  // precedence (low → high):
+  // ||  →  &&  →  comparisons  →  + - | ^ &  →  * / << >>  →  primary
   fn parse_expression(&mut self) -> Expression {
-    let mut expr = self.parse_term();
+    let mut expr = self.parse_logical_and();
+    while let Some(Token::OrOr) = self.peek_token() {
+        self.advance();
+        let right = self.parse_logical_and();
+        expr = Expression::BinaryOp(Box::new(expr), "||".to_string(), Box::new(right));
+    }
+    expr
+  }
 
+  fn parse_logical_and(&mut self) -> Expression {
+    let mut expr = self.parse_comparison();
+    while let Some(Token::AndAnd) = self.peek_token() {
+        self.advance();
+        let right = self.parse_comparison();
+        expr = Expression::BinaryOp(Box::new(expr), "&&".to_string(), Box::new(right));
+    }
+    expr
+  }
+
+  fn parse_comparison(&mut self) -> Expression {
+    let mut expr = self.parse_term();
     while let Some(token) = self.peek_token() {
         match token {
-            Token::EqEq | Token::NotEq | Token::Greater | Token::Less | 
+            Token::EqEq | Token::NotEq | Token::Greater | Token::Less |
             Token::GreaterEq | Token::LessEq => {
-                let current_token = self.advance(); 
-                let op = self.token_to_string(current_token); 
-                
+                let current_token = self.advance();
+                let op = self.token_to_string(current_token);
                 let right = self.parse_term();
                 expr = Expression::BinaryOp(Box::new(expr), op, Box::new(right));
             }
@@ -312,14 +389,12 @@ if self.match_token(Token::Bnw) {
         }
     }
     expr
-}
- 
-    fn parse_term(&mut self) -> Expression {
-    let mut expr = self.parse_factor(); 
+  }
 
+  fn parse_term(&mut self) -> Expression {
+    let mut expr = self.parse_factor();
     while let Some(token) = self.peek_token() {
         match token {
-  
             Token::Plus | Token::Minus | Token::Pipe | Token::Caret | Token::Ampersand => {
                 let current_token = self.advance();
                 let op = self.token_to_string(current_token);
@@ -330,27 +405,49 @@ if self.match_token(Token::Bnw) {
         }
     }
     expr
-}
+  }
 
-
-    fn parse_factor(&mut self) -> Expression {
-    let mut expr = self.primary(); 
-
+  fn parse_factor(&mut self) -> Expression {
+    let mut expr = self.unary();
     while let Some(token) = self.peek_token() {
         match token {
-       
-            Token::Star | Token::Slash | Token::ShiftLeft | Token::ShiftRight => {
+            Token::Star | Token::Slash | Token::Percent | Token::ShiftLeft | Token::ShiftRight => {
                 let current_token = self.advance();
                 let op = self.token_to_string(current_token);
-                let right = self.primary();
+                let right = self.unary();
                 expr = Expression::BinaryOp(Box::new(expr), op, Box::new(right));
             }
             _ => break,
         }
     }
     expr
-}
+  }
 
+  fn unary(&mut self) -> Expression {
+      match self.peek_token() {
+          Some(Token::Minus) => {
+              self.advance();
+              let inner = self.unary();
+              // 0 - x
+              Expression::BinaryOp(
+                  Box::new(Expression::Number(0, TypeKind::Unknown)),
+                  "-".to_string(),
+                  Box::new(inner),
+              )
+          }
+          Some(Token::Bang) => {
+              self.advance();
+              let inner = self.unary();
+              // logical not: (inner == 0) → 1 if zero, else 0
+              Expression::BinaryOp(
+                  Box::new(inner),
+                  "==".to_string(),
+                  Box::new(Expression::Number(0, TypeKind::Unknown)),
+              )
+          }
+          _ => self.primary(),
+      }
+  }
 
     fn primary(&mut self) -> Expression {
         match self.peek() {
@@ -393,7 +490,7 @@ if self.match_token(Token::Bnw) {
         }
         if self.match_token(Token::Dot) {
     let field = if let Token::Identifier(f) = self.advance() { f } else {
-        eprintln!("[PARSER ERROR] Expected field name after '.'");
+        self.error("Expected field name after '.'");
         std::process::exit(1);
     };
     return Expression::FieldAccess(s, field);
@@ -418,20 +515,38 @@ if self.match_token(Token::Bnw) {
         Expression::Inb(Box::new(port))
     }
 
+Token::Syscall => {
+                self.advance();
+                self.consume(Token::LParen);
+                let mut args = Vec::new();
+                if !self.check(Token::RParen) {
+                    loop {
+                        args.push(self.parse_expression());
+                        if !self.match_token(Token::Comma) { break; }
+                    }
+                }
+                self.consume(Token::RParen);
+                Expression::Syscall(args)
+            }
+
 Token::Ampersand => {
                 self.advance();
                 if let Token::Identifier(name) = self.advance() {
                     Expression::AddressOf(name)
                 } else {
-                    eprintln!("[PARSER ERROR] Expected function name after '&'");
+                    self.error("Expected function name after '&'");
                     std::process::exit(1);
                 }
             }
 
             _ => {
-                eprintln!("[PARSER ERROR] Unexpected token in expression: {:?}", self.peek());
-                eprintln!("[HINT] Expected: number, variable, (, or peek(...)");
-                std::process::exit(1);
+                {
+                    let tok = self.peek();
+                    self.error(&format!("Unexpected token in expression: {:?}", tok));
+                    eprintln!("[HINT] Expected: number, variable, (, unary -, !, or peek(...)");
+                    self.synchronize();
+                    Expression::Number(0, TypeKind::Unknown)
+                }
             }
         }
     }
@@ -440,7 +555,7 @@ Token::Ampersand => {
     let n = if let Token::Identifier(s) = self.advance() {
         s
     } else {
-        eprintln!("[PARSER ERROR] Expected identifier after 'root'");
+        self.error("Expected identifier after 'root'");
         std::process::exit(1);
     };
 
@@ -629,14 +744,14 @@ fn loop_statement(&mut self) -> Statement {
         }
 fn parse_struct(&mut self) -> Statement {
     let name = if let Token::Identifier(s) = self.advance() { s } else {
-        eprintln!("[PARSER ERROR] Expected struct name");
+        self.error("Expected struct name");
         std::process::exit(1);
     };
     self.consume(Token::LBrace);
     let mut fields = Vec::new();
     while !self.check(Token::RBrace) && !self.is_at_end() {
         let field_name = if let Token::Identifier(s) = self.advance() { s } else {
-            eprintln!("[PARSER ERROR] Expected field name");
+            self.error("Expected field name");
             std::process::exit(1);
         };
         self.consume(Token::At);
@@ -658,7 +773,7 @@ fn parse_struct(&mut self) -> Statement {
 
 fn int_handler_stmt(&mut self) -> Statement {
     let name = if let Token::Identifier(s) = self.advance() { s } else {
-        eprintln!("[PARSER ERROR] Expected handler name after 'int'");
+        self.error("Expected handler name after 'int'");
         std::process::exit(1);
     };
     self.consume(Token::LBrace);
@@ -675,7 +790,7 @@ fn int_enable_stmt(&mut self) -> Statement {
     let vector_id = self.parse_expression();
     self.consume(Token::Comma);
     let handler_name = if let Token::Identifier(s) = self.advance() { s } else {
-        eprintln!("[PARSER ERROR] Expected handler name in int_enable");
+        self.error("Expected handler name in int_enable");
         std::process::exit(1);
     };
     self.consume(Token::RParen);

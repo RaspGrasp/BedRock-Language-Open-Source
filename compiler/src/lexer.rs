@@ -1,7 +1,7 @@
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
 
-    Fn, Let, Loop, While, Asm, If, Else, Return, Root, Inb, Outb, Break, Poke, Peek, Include, Call, Struct, Dot, Bnw, Int, IntEnable, IntDisable, SaveCtx, RestoreCtx,
+    Fn, Let, Loop, While, Asm, If, Else, Return, Root, Inb, Outb, Break, Poke, Peek, Include, Call, Struct, Dot, Bnw, Int, IntEnable, IntDisable, SaveCtx, RestoreCtx, Syscall,
 
     U8, U16, U32, U64,
     I8, I16, I32, I64,
@@ -15,7 +15,8 @@ pub enum Token {
     ShiftLeft, ShiftRight,
     Plus, Minus, Star, Slash,
     EqEq, NotEq, Greater, Less, GreaterEq, LessEq,
-    Ampersand, Pipe, Caret,
+    Ampersand, Pipe, Caret, Percent, Bang,
+    AndAnd, OrOr,
     EOF,
 }
 
@@ -27,6 +28,9 @@ pub struct Lexer {
 }
 
 impl Lexer {
+    pub fn line(&self) -> usize { self.line }
+    pub fn col(&self) -> usize { self.col }
+
     pub fn new(input: &str) -> Self {
         Lexer {
             input: input.chars().collect(),
@@ -58,8 +62,25 @@ impl Lexer {
             '-' => { self.advance_char(); Token::Minus }
             '^' => { self.advance_char(); Token::Caret }
             '*' => { self.advance_char(); Token::Star }
-            '&' => { self.advance_char(); Token::Ampersand }
-            '|' => { self.advance_char(); Token::Pipe }
+            '%' => { self.advance_char(); Token::Percent }
+            '&' => {
+                self.advance_char();
+                if self.pos < self.input.len() && self.input[self.pos] == '&' {
+                    self.advance_char();
+                    Token::AndAnd
+                } else {
+                    Token::Ampersand
+                }
+            }
+            '|' => {
+                self.advance_char();
+                if self.pos < self.input.len() && self.input[self.pos] == '|' {
+                    self.advance_char();
+                    Token::OrOr
+                } else {
+                    Token::Pipe
+                }
+            }
             '@' => { self.advance_char(); Token::At }
             '.' => { self.advance_char(); Token::Dot }
             '/' => {
@@ -84,8 +105,7 @@ impl Lexer {
                 if self.pos < self.input.len() && self.input[self.pos] == '=' {
                     self.advance_char(); Token::NotEq
                 } else {
-                    eprintln!("[LEXER ERROR] Expected '=' after '!' at line {}, col {}", self.line, self.col);
-                    Token::EOF
+                    Token::Bang
                 }
             }
             '>' => {
@@ -171,6 +191,7 @@ impl Lexer {
             "loop"    => Token::Loop,
             "while"   => Token::While,
             "asm"     => Token::Asm,
+            "syscall" => Token::Syscall,
             "if"      => Token::If,
             "else"    => Token::Else,
             "return"  => Token::Return,
@@ -235,17 +256,38 @@ impl Lexer {
         Token::Number(value)
     }
 
-    fn read_string(&mut self) -> Token {
-        let start = self.pos;
-        while self.pos < self.input.len() && self.input[self.pos] != '"' {
+        fn read_string(&mut self) -> Token {
+        // pos is at opening quote
+        if self.pos < self.input.len() && self.input[self.pos] == '"' {
             self.advance_char();
         }
-        if self.pos >= self.input.len() {
-            eprintln!("[LEXER ERROR] Unterminated string literal");
-            return Token::EOF;
+        let mut s = String::new();
+        while self.pos < self.input.len() {
+            let ch = self.input[self.pos];
+            if ch == '"' {
+                self.advance_char();
+                break;
+            }
+            if ch == '\\' {
+                self.advance_char();
+                if self.pos >= self.input.len() { break; }
+                let e = self.input[self.pos];
+                let mapped = match e {
+                    'n' => '\n',
+                    't' => '\t',
+                    'r' => '\r',
+                    '0' => '\0',
+                    '\\' => '\\',
+                    '"' => '"',
+                    other => other,
+                };
+                s.push(mapped);
+                self.advance_char();
+            } else {
+                s.push(ch);
+                self.advance_char();
+            }
         }
-        let s: String = self.input[start..self.pos].iter().collect();
-        self.advance_char();
         Token::StringLiteral(s)
     }
 }

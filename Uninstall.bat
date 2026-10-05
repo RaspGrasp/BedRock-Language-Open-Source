@@ -35,8 +35,8 @@ if %errorLevel% equ 0 (
 echo.
 echo Checking System PATH...
 
-:: Locate bedrockco.exe to identify the path to remove
-set "TARGET_EXE=bedrockco.exe"
+:: Locate brc3.exe to identify the path to remove
+set "TARGET_EXE=brc3.exe"
 set "FOUND_PATH="
 
 :: Check possible locations (same logic as setup)
