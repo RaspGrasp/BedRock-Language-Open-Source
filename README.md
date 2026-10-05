@@ -31,6 +31,47 @@ Driver binary is brc3 same entry as bedrockco or bedrock when those aliases are 
 
 Docs for the language surface live at https://bedrock.abrdns.com
 
+
+## Compiler pipeline
+
+```text
+.source.br
+    │
+    ▼
+┌─────────┐
+│  Lexer  │  tokens + includes
+└────┬────┘
+     ▼
+┌─────────┐
+│ Parser  │  AST
+└────┬────┘
+     ▼
+┌────────────────┐
+│ Type inference │
+└────┬───────────┘
+     ▼
+┌──────────┐
+│ Verifier │
+└────┬─────┘
+     ▼
+┌─────────────────────┐
+│ Optimizer optional  │  -O 1..3
+└────┬────────────────┘
+     ▼
+┌────────────┐
+│ IR builder │  main entry when main exists
+└────┬───────┘
+     ▼
+┌──────────────────────────────┐
+│ Backend                      │
+│ mips │ mips-le │ riscv │ x86 │ ir
+└──────────────────────────────┘
+     ▼
+.bin  .elf  or  .ir
+```
+
+One IR shared across targets. Raw asm hex stays architecture specific.
+
 ## Project timeline
 
 Initial development of architecture and compiler logic started December 2025.
