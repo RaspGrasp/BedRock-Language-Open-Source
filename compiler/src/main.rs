@@ -1,7 +1,3 @@
-//! BedRock Compiler — CLI entry point
-//! Foundation release: multi-target IR pipeline (MIPS / RISC-V / x86-64).
-
-// Backend stubs and register pools intentionally retain unused items.
 #![allow(dead_code)]
 
 mod type_inference;
@@ -13,12 +9,19 @@ mod codegen;
 mod verifier;
 mod ir;
 
-use std::{env, fs, io::IsTerminal, path::{Path, PathBuf}, process};
+use std::{
+    env, fs,
+    io::{self, IsTerminal, Write},
+    path::{Path, PathBuf},
+    process,
+    time::Duration,
+    thread,
+};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-const NAME: &str = "bedrockco";
-
-// ── ANSI styling (no external crates) ─────────────────────
+const NAME: &str = "brc3";
+const REGISTRY_BASE: &str = "https://raw.githubusercontent.com/RaspGrasp/brc3_lib/main";
+const LIB_DIR_NAME: &str = "brc3_lib";
 
 struct Style {
     color: bool,
@@ -48,21 +51,28 @@ impl Style {
     fn blue(&self, t: &str) -> String { self.paint("1;34", t) }
     fn magenta(&self, t: &str) -> String { self.paint("1;35", t) }
     fn cyan(&self, t: &str) -> String { self.paint("1;36", t) }
+    fn white(&self, t: &str) -> String { self.paint("1;37", t) }
+    fn bg_green(&self, t: &str) -> String { self.paint("42;30", t) }
+    fn bg_cyan(&self, t: &str) -> String { self.paint("46;30", t) }
+    fn bg_blue(&self, t: &str) -> String { self.paint("44;37", t) }
+    fn bright_green(&self, t: &str) -> String { self.paint("92", t) }
+    fn bright_cyan(&self, t: &str) -> String { self.paint("96", t) }
+    fn bright_magenta(&self, t: &str) -> String { self.paint("95", t) }
 }
 
 fn banner(s: &Style) {
     eprintln!();
     eprintln!(
         "  {}  {}",
-        s.bold(&s.cyan("━━━")),
-        s.bold("BedRock Compiler")
+        s.bold(&s.bright_cyan("━━━")),
+        s.bold(&s.white("BedRock Compiler"))
     );
     eprintln!(
-        "  {}  {}  ·  multi-target · bare-metal",
+        "  {}  {}  ·  multi-target · packages",
         s.dim("│"),
         s.dim(&format!("v{VERSION}"))
     );
-    eprintln!("  {}", s.bold(&s.cyan("━━━")));
+    eprintln!("  {}", s.bold(&s.bright_cyan("━━━")));
     eprintln!();
 }
 
@@ -74,6 +84,8 @@ fn print_help(s: &Style) {
 {cmd}
 
     {bin} {file} [OPTIONS]
+    {bin} {ins} {pkg}
+    {bin} {list}
 
 {targets}
 
@@ -95,6 +107,11 @@ fn print_help(s: &Style) {
     {o_v}         print version and exit
     {o_h}            show this help
 
+{pkg_sec}
+
+    {ins_ex}
+    {list_ex}
+
 {examples}
 
     {ex1}
@@ -105,12 +122,16 @@ fn print_help(s: &Style) {
 {docs}
 
     Language reference:  https://bedrock.abrdns.com
+   
 ",
-        usage = s.bold("USAGE"),
-        cmd = s.dim("Compile a .br source file to machine code or IR."),
+        usage = s.bold(&s.bright_cyan("USAGE")),
+        cmd = s.dim("Compile a .br source file or manage packages."),
         bin = s.cyan(NAME),
         file = s.yellow("<file.br>"),
-        targets = s.bold("TARGETS"),
+        ins = s.green("ins"),
+        pkg = s.yellow("<package>"),
+        list = s.green("list"),
+        targets = s.bold(&s.bright_cyan("TARGETS")),
         t_mips = s.green("mips"),
         t_mle = s.green("mips-le"),
         t_rv = s.green("riscv"),
@@ -119,7 +140,7 @@ fn print_help(s: &Style) {
         t_arm = s.dim("arm"),
         def = s.dim("(default)"),
         stub = s.yellow("(stub — not implemented)"),
-        options = s.bold("OPTIONS"),
+        options = s.bold(&s.bright_cyan("OPTIONS")),
         o_o = s.cyan("-o"),
         path = s.yellow("<path>"),
         o_t = s.cyan("--target"),
@@ -131,12 +152,15 @@ fn print_help(s: &Style) {
         o_nc = s.cyan("--no-color"),
         o_v = s.cyan("--version"),
         o_h = s.cyan("--help"),
-        examples = s.bold("EXAMPLES"),
+        pkg_sec = s.bold(&s.bright_cyan("PACKAGES")),
+        ins_ex = s.dim(&format!("{NAME} ins mathutils")),
+        list_ex = s.dim(&format!("{NAME} list")),
+        examples = s.bold(&s.bright_cyan("EXAMPLES")),
         ex1 = s.dim(&format!("{NAME} app.br --target riscv -o out/app.bin")),
         ex2 = s.dim(&format!("{NAME} app.br --target x86 -o app.elf")),
         ex3 = s.dim(&format!("{NAME} app.br --target ir")),
         ex4 = s.dim(&format!("{NAME} app.br --optimize 2 --target mips")),
-        docs = s.bold("DOCS"),
+        docs = s.bold(&s.bright_cyan("DOCS")),
     );
 }
 
@@ -144,8 +168,8 @@ fn print_version(s: &Style) {
     eprintln!(
         "{} {} ({})",
         s.bold(NAME),
-        s.cyan(&format!("v{VERSION}")),
-        s.dim("foundation")
+        s.bright_cyan(&format!("v{VERSION}")),
+        s.dim("foundation + packages")
     );
     eprintln!(
         "{}",
@@ -167,6 +191,8 @@ struct Cli {
     no_color: bool,
     want_help: bool,
     want_version: bool,
+    install_pkg: Option<String>,
+    list_pkgs: bool,
 }
 
 fn parse_cli(args: &[String]) -> Result<Cli, String> {
@@ -180,6 +206,8 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
         no_color: false,
         want_help: false,
         want_version: false,
+        install_pkg: None,
+        list_pkgs: false,
     };
 
     let mut i = 1;
@@ -199,6 +227,15 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
             i += 1;
         } else if flag_eq(a, &["--bridge"]) {
             cli.use_bridge = true;
+            i += 1;
+        } else if flag_eq(a, &["ins", "install"]) {
+            let v = args
+                .get(i + 1)
+                .ok_or_else(|| String::from("missing package name for ins"))?;
+            cli.install_pkg = Some(v.clone());
+            i += 2;
+        } else if flag_eq(a, &["list"]) {
+            cli.list_pkgs = true;
             i += 1;
         } else if flag_eq(a, &["--target", "-t"]) {
             let v = args
@@ -235,6 +272,76 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
     Ok(cli)
 }
 
+fn lib_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Ok(cwd) = env::current_dir() {
+        dirs.push(cwd.join(LIB_DIR_NAME));
+    }
+    if let Ok(home) = env::var("HOME") {
+       dirs.push(PathBuf::from(&home).join(LIB_DIR_NAME));
+       dirs.push(PathBuf::from(&home).join(".brc3").join("lib"));
+    }
+    if let Ok(home) = env::var("USERPROFILE") {
+        dirs.push(PathBuf::from(home).join(LIB_DIR_NAME));
+    }
+    dirs.push(PathBuf::from("/usr/local/lib").join(LIB_DIR_NAME));
+    dirs
+}
+
+fn ensure_lib_dir(s: &Style) -> PathBuf {
+    let preferred = env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join(LIB_DIR_NAME);
+    if !preferred.exists() {
+        if let Err(e) = fs::create_dir_all(&preferred) {
+            eprintln!(
+                "{}  cannot create {}: {e}",
+                s.red("error:"),
+                preferred.display()
+            );
+            process::exit(1);
+        }
+        eprintln!(
+            "{}  created {}",
+            s.bright_green("ok:"),
+            s.bold(&preferred.display().to_string())
+        );
+    }
+    preferred
+}
+
+fn resolve_include(file_name: &str, base_path: &Path) -> Option<PathBuf> {
+    let candidates: Vec<String> = if file_name.ends_with(".br") {
+        vec![file_name.to_string()]
+    } else {
+        vec![
+            file_name.to_string(),
+            format!("{}.br", file_name),
+        ]
+    };
+
+    for name in &candidates {
+        let p = base_path.join(name);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+
+    for dir in lib_dirs() {
+        for name in &candidates {
+            let p = dir.join(name);
+            if p.is_file() {
+                return Some(p);
+            }
+            let p2 = dir.join(name.trim_end_matches(".br")).join(name);
+            if p2.is_file() {
+                return Some(p2);
+            }
+        }
+    }
+    None
+}
+
 fn process_includes(
     content: String,
     base_path: &Path,
@@ -248,7 +355,22 @@ fn process_includes(
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.len() > 1 {
                 let file_name = parts[1].replace('\"', "").replace(';', "");
-                let include_path = base_path.join(&file_name);
+                let include_path = match resolve_include(&file_name, base_path) {
+                    Some(p) => p,
+                    None => {
+                        eprintln!(
+                            "{}  include file not found: '{}'",
+                            s.red("error:"),
+                            file_name
+                        );
+                        eprintln!(
+                            "{}  searched: source dir + {}",
+                            s.dim("…"),
+                            LIB_DIR_NAME
+                        );
+                        process::exit(1);
+                    }
+                };
                 let canonical = match include_path.canonicalize() {
                     Ok(p) => p.to_string_lossy().to_string(),
                     Err(_) => include_path.to_string_lossy().to_string(),
@@ -307,10 +429,205 @@ fn process_includes(
     final_code
 }
 
+fn progress_bar(s: &Style, label: &str, pct: u8) {
+    let width = 28usize;
+    let filled = ((pct as usize) * width) / 100;
+    let empty = width - filled;
+    let bar = if s.color {
+        let mut out = String::new();
+        for i in 0..filled {
+            let hue = if i < width / 3 {
+                "42"
+            } else if i < 2 * width / 3 {
+                "46"
+            } else {
+                "44"
+            };
+            out.push_str(&format!("\x1b[{}m \x1b[0m", hue));
+        }
+        out.push_str(&" ".repeat(empty));
+        out
+    } else {
+        format!("{}{}", "█".repeat(filled), "░".repeat(empty))
+    };
+    let pct_str = format!("{:>3}%", pct);
+    eprint!(
+        "\r  {} {} [{}] {}",
+        s.bright_cyan("↓"),
+        s.bold(label),
+        bar,
+        s.bright_green(&pct_str)
+    );
+    let _ = io::stderr().flush();
+}
+
+fn download_package(name: &str, s: &Style) {
+    let clean = name.trim().trim_end_matches(".br");
+    if clean.is_empty() {
+        eprintln!("{}  empty package name", s.red("error:"));
+        process::exit(1);
+    }
+
+    let lib_dir = ensure_lib_dir(s);
+    let dest = lib_dir.join(format!("{}.br", clean));
+
+    if dest.exists() {
+        eprintln!(
+            "{}  package already installed: {}",
+            s.yellow("warn:"),
+            s.bold(clean)
+        );
+        eprintln!(
+            "{}  path: {}",
+            s.dim("…"),
+            dest.display()
+        );
+        return;
+    }
+
+    let urls = [
+        format!("{}/{}.br", REGISTRY_BASE, clean),
+        format!("{}/{}/{}.br", REGISTRY_BASE, clean, clean),
+        format!("{}/packages/{}.br", REGISTRY_BASE, clean),
+    ];
+
+    eprintln!(
+        "{}  installing {}",
+        s.blue("info:"),
+        s.bold(&s.bright_magenta(clean))
+    );
+
+    progress_bar(s, clean, 5);
+    thread::sleep(Duration::from_millis(80));
+
+    let mut success = false;
+    let mut last_err = String::new();
+
+    for (idx, url) in urls.iter().enumerate() {
+        let pct = 10 + (idx as u8) * 20;
+        progress_bar(s, clean, pct);
+
+        let tmp = lib_dir.join(format!(".tmp_{}.br", clean));
+        let status = process::Command::new("curl")
+            .args([
+                "-fsSL",
+                "--connect-timeout",
+                "12",
+                "--max-time",
+                "60",
+                "-o",
+                tmp.to_str().unwrap_or("/tmp/brc3_tmp.br"),
+                url,
+            ])
+            .status();
+
+        match status {
+            Ok(st) if st.success() => {
+                if let Ok(meta) = fs::metadata(&tmp) {
+                    if meta.len() > 0 {
+                        progress_bar(s, clean, 85);
+                        if fs::rename(&tmp, &dest).is_ok() {
+                            progress_bar(s, clean, 100);
+                            eprintln!();
+                            eprintln!(
+                                "{}  installed {} → {}",
+                                s.bright_green("ok:"),
+                                s.bold(clean),
+                                s.cyan(&dest.display().to_string())
+                            );
+                            success = true;
+                            break;
+                        }
+                    }
+                }
+                let _ = fs::remove_file(&tmp);
+                last_err = format!("empty response from {}", url);
+            }
+            Ok(_) => {
+                let _ = fs::remove_file(&tmp);
+                last_err = format!("not found: {}", url);
+            }
+            Err(e) => {
+                last_err = format!("curl failed: {e}");
+            }
+        }
+        thread::sleep(Duration::from_millis(60));
+    }
+
+    if !success {
+        eprintln!();
+        eprintln!(
+            "{}  failed to install '{}'",
+            s.red("error:"),
+            clean
+        );
+        eprintln!("{}  {}", s.dim("…"), last_err);
+        eprintln!(
+            "{}  registry: {}",
+            s.dim("…"),
+            REGISTRY_BASE
+        );
+        process::exit(1);
+    }
+}
+
+fn list_packages(s: &Style) {
+    eprintln!(
+        "{}  scanning local packages…",
+        s.blue("info:")
+    );
+    let mut found = false;
+    for dir in lib_dirs() {
+        if !dir.is_dir() {
+            continue;
+        }
+        if let Ok(entries) = fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.extension().map(|e| e == "br").unwrap_or(false) {
+                    if !found {
+                        eprintln!();
+                        eprintln!(
+                            "  {}  {}",
+                            s.bold(&s.bright_cyan("PACKAGES")),
+                            s.dim(&dir.display().to_string())
+                        );
+                    }
+                    found = true;
+                    let name = p
+                        .file_stem()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string();
+                    let size = fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+                    eprintln!(
+                        "  {}  {}  {}",
+                        s.bright_green("•"),
+                        s.bold(&name),
+                        s.dim(&format!("({} bytes)", size))
+                    );
+                }
+            }
+        }
+    }
+    if !found {
+        eprintln!(
+            "{}  no packages installed yet",
+            s.yellow("warn:")
+        );
+        eprintln!(
+            "{}  try: {} ins <name>",
+            s.dim("…"),
+            NAME
+        );
+    } else {
+        eprintln!();
+    }
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
 
-    // Pre-scan for --no-color before any output
     let no_color_early = args.iter().any(|a| a == "--no-color");
     let s = Style::new(no_color_early);
 
@@ -334,6 +651,16 @@ fn main() {
     }
     if cli.want_version {
         print_version(&s);
+        process::exit(0);
+    }
+
+    if let Some(pkg) = &cli.install_pkg {
+        download_package(pkg, &s);
+        process::exit(0);
+    }
+
+    if cli.list_pkgs {
+        list_packages(&s);
         process::exit(0);
     }
 
@@ -387,7 +714,7 @@ fn main() {
         "{}  compiling {}  →  {}",
         s.blue("info:"),
         s.bold(&source_path.display().to_string()),
-        s.cyan(target.name())
+        s.bright_cyan(target.name())
     );
 
     let base_path = source_path.parent().unwrap_or(Path::new("."));
@@ -469,7 +796,7 @@ fn main() {
         "{}  mode {}  target={}",
         s.blue("info:"),
         s.magenta("IR pipeline"),
-        s.cyan(target.name())
+        s.bright_cyan(target.name())
     );
 
     let mut ir_builder = ir::builder::IrBuilder::new();
@@ -503,7 +830,7 @@ fn main() {
 
     eprintln!(
         "{}  wrote {}  ({} bytes)",
-        s.green("ok:"),
+        s.bright_green("ok:"),
         s.bold(&out_path.display().to_string()),
         binary.len()
     );
