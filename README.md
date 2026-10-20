@@ -112,14 +112,23 @@ cargo build --release
 ## Links
 
 Language documentation:
+
 https://bedrock.abrdns.com
 
 
+
+
+
 VS Code Marketplace publisher:
+
 https://marketplace.visualstudio.com/publishers/mrDevRussia
 
 
+
+
+
 VS Code BedRock extension:
+
 https://marketplace.visualstudio.com/items?itemName=mrDevRussia.bedrock-lang
 
 
