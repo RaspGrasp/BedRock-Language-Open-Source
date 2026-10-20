@@ -145,8 +145,7 @@ Applied Examples:
 
 https://github.com/RaspGrasp/BedRock-Language-Example-Apps
 
-<img width="1536" height="1024" alt="image" src="https://github.com/user-attachments/assets/5d7987eb-eeec-4454-b431-1cc266d5c5ef" />
-
+<img width="1536" height="1024" alt="image" src="https://github.com/user-attachments/assets/ad0e3225-618c-4f7c-8d56-11535713ecc0" />
 
 ## Credit and scope
 
