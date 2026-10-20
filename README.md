@@ -117,6 +117,9 @@ VS Code Marketplace publisher https://marketplace.visualstudio.com/publishers/mr
 
 VS Code BedRock extension https://marketplace.visualstudio.com/items?itemName=mrDevRussia.bedrock-lang
 
+<img width="1536" height="1024" alt="image" src="https://github.com/user-attachments/assets/5d7987eb-eeec-4454-b431-1cc266d5c5ef" />
+
+
 ## Credit and scope
 
 Compiler core lexer parser typing IR optimizers and the long MIPS line are original project work. Later backend and tooling passes used assistants for review and grunt work with testing and ownership kept on the author side.
