@@ -1,3 +1,7 @@
+## Future ISEF 2027 Competitor
+This project is pretend to be in ISEF Egypt 2027 local exhibitions  
+
+
 # BedRock Programming Language
 
 BedRock is a low-level systems language for direct hardware control and OS-style work.
