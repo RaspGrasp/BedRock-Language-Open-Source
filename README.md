@@ -151,6 +151,12 @@ Applied Examples:
 
 https://github.com/RaspGrasp/BedRock-Language-Example-Apps
 
+
+
+Docs Repo:
+
+https://github.com/RaspGrasp/bedrock-docs
+
 <img width="1536" height="1024" alt="image" src="https://github.com/user-attachments/assets/ad0e3225-618c-4f7c-8d56-11535713ecc0" />
 
 ## Credit and scope
