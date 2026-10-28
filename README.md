@@ -13,11 +13,13 @@ High-level logic maps to fixed machine sequences with no hidden runtime and no l
 
 Three rules drive the design.
 
-No Magic. What you write is what runs. No GC no implicit allocations no virtual dispatch by default.
+No Magic. What you write is what runs. 
+No GC no implicit allocations no virtual dispatch by default.
 
 Byte-Level Validation. Output is raw words you can audit with a hex view or objdump.
 
-Direct Hardware Control. poke peek outb inb and asm reach memory and devices without an OS layer in the middle.
+Direct Hardware Control. 
+poke peek outb inb and asm reach memory and devices without an OS layer in the middle.
 
 ## What you get
 
