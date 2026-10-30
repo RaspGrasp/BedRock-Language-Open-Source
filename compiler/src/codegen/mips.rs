@@ -1,7 +1,7 @@
 use crate::ast::{Statement, Expression, TypeKind};
 use crate::ir::{IrModule, IrOp, Operand};
 use crate::codegen::{Backend, SourceMapEntry};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 const BASE_ADDR: u32 = 0x80000000;
 
@@ -1155,7 +1155,7 @@ impl LegacyCodegen {
             }
             Expression::BinaryOp(l,op,r) => {
                 let lr=self.alloc_reg(); self.gen_expr(l,lr);
-                if op=="<<" || op==">>"  { if let Expression::Number(s,_)=r.as_ref() { let sa=(*s&31) as u32; if op=="<<" { self.emit(0x00000000|(lr<<16)|(dest<<11)|(sa<<6)); } else { self.emit(0x00000002|(lr<<16)|(dest<<11)|(sa<<6)); } self.free_reg(lr); return; } }
+                if (op=="<<" || op==">>") { if let Expression::Number(s,_)=r.as_ref() { let sa=(*s&31) as u32; if op=="<<" { self.emit(0x00000000|(lr<<16)|(dest<<11)|(sa<<6)); } else { self.emit(0x00000002|(lr<<16)|(dest<<11)|(sa<<6)); } self.free_reg(lr); return; } }
                 let rr=self.alloc_reg(); self.gen_expr(r,rr);
                 match op.as_str() {
                     "+" => self.emit(0x00000021|(lr<<21)|(rr<<16)|(dest<<11)),

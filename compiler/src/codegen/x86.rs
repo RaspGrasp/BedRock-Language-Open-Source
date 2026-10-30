@@ -104,6 +104,7 @@ pub struct X86Backend {
     cf_right: Option<u8>,
     data_symbols: HashMap<String, u64>,
     root_vars: HashSet<String>,
+    string_roots: HashSet<String>,
     next_data: u64,
     base_addr: u64,
     stack_addr: u64,
@@ -128,6 +129,7 @@ impl X86Backend {
             cf_right: None,
             data_symbols: HashMap::new(),
             root_vars: HashSet::new(),
+            string_roots: HashSet::new(),
             next_data: 0,
             base_addr: DEFAULT_BASE,
             stack_addr: DEFAULT_BASE + 0x200000,
@@ -400,7 +402,13 @@ impl X86Backend {
                 }
                 if self.root_vars.contains(name) {
                     let addr = *self.data_symbols.get(name).unwrap_or(&0);
-                    self.emit_load_abs(temp, addr);
+                    if self.string_roots.contains(name) {
+                        // string: the variable holds the address of the data
+                        self.emit_mov_reg_imm64(temp, addr);
+                    } else {
+                        // numeric root: load the value stored at the address
+                        self.emit_load_abs(temp, addr);
+                    }
                     return temp;
                 }
                 match self.alloc.alloc(name) {
@@ -695,7 +703,9 @@ impl X86Backend {
                 if let Some(Operand::Label(label)) = instr.operands.first() {
                     self.ensure_frame();
                     // Save live GPRs to frame (not on stack — args already pushed)
-                    let saves: Vec<u8> = self.alloc.map.values().copied().collect();
+                    let mut saves: Vec<u8> = self.alloc.map.values().copied().collect();
+                    saves.sort_unstable();
+                    saves.dedup();
                     for (i, &r) in saves.iter().enumerate() {
                         let off = -((0x50 + i * 8) as i32);
                         self.emit_store64(RBP, off, r);
@@ -719,7 +729,12 @@ impl X86Backend {
                     let r = self.operand_to_reg(val, RAX);
                     self.emit_mov_rr(RAX, r);
                 }
-                self.leave_frame();
+                // epilogue on THIS path only; frame_active stays set so later returns in the same
+                // function (e.g. `if (..) { return x; } return y;`) still restore rsp/rbp
+                if self.frame_active {
+                    self.emit_mov_rr(RSP, RBP);
+                    self.emit_pop(RBP);
+                }
                 self.emit_ret();
             }
             IrOp::Psh => {
@@ -750,13 +765,15 @@ impl X86Backend {
 
                 // Save live allocated regs clobbered by syscall (rax,rcx,rdx,rsi,rdi,r8-r11)
                 let clobbered = [RAX, RCX, RDX, RSI, RDI, R8, R9, R10, R11];
-                let saves: Vec<u8> = self
+                let mut saves: Vec<u8> = self
                     .alloc
                     .map
                     .values()
                     .copied()
                     .filter(|r| clobbered.contains(r))
                     .collect();
+                saves.sort_unstable();
+                saves.dedup();
                 for &r in &saves {
                     self.emit_push(r);
                 }
@@ -950,6 +967,7 @@ impl Backend for X86Backend {
         self.data_bytes.clear();
         self.data_symbols.clear();
         self.root_vars.clear();
+        self.string_roots.clear();
         self.pending_frame = true;
         self.frame_active = false;
 
@@ -972,9 +990,8 @@ impl Backend for X86Backend {
             }
         }
 
-        // Fixed data region for absolute addresses during codegen
-        // (must match ELF layout: after ~64KB text budget from base)
-        if self.data_addr == DEFAULT_BASE + 0x100000 || self.data_addr == 0 {
+        // Only override if the user never set DATA (still at construction default)
+        if self.data_addr == 0 {
             self.data_addr = self.base_addr + 0x20000;
         }
 
@@ -988,6 +1005,8 @@ impl Backend for X86Backend {
                         {
                             let addr = self.data_addr + self.data_bytes.len() as u64;
                             self.data_symbols.insert(name.clone(), addr);
+                            self.root_vars.insert(name.clone());
+                            self.string_roots.insert(name.clone());
                             self.data_bytes.extend(s.bytes());
                             self.data_bytes.push(0);
                         }
@@ -1022,7 +1041,7 @@ impl Backend for X86Backend {
         // For entry: first byte of code
 
         let text = self.code.clone();
-        let elf = self.build_elf(&text);
+        let mut elf = self.build_elf(&text);
 
         // CRITICAL: rel32 are correct within text; but we need e_entry =
         // base + text_off, and any absolute data addresses independent.

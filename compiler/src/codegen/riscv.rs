@@ -141,7 +141,7 @@ enum AllocResult {
 
 enum PatchKind {
     Jal { rd: u32 },
-    Branch { funct3: u32, rs1: u32, rs2: u32 },
+    Branch { funct3: u32, rs1: u32, rs2: u32, ord: usize, long: bool },
     LuiAddi { rd: u32 },
 }
 
@@ -159,6 +159,13 @@ pub struct RiscvBackend {
 
     labels:        HashMap<String, usize>,
     label_patches: Vec<(usize, String, PatchKind)>,
+    long_branches: HashSet<usize>, // ordinals of conditional branches that need the 2-instruction long form (target beyond +-4KB)
+    new_long:      HashSet<usize>,
+    big_funcs:     HashSet<usize>, // functions whose frame needs the 2-instruction (>2040 byte) prologue/epilogue
+    new_big:       HashSet<usize>,
+    func_ord:      usize,
+    frame_wide:    bool,
+    branch_ord:    usize,
 
     cf_left:  Option<u32>,
     cf_right: Option<u32>,
@@ -167,6 +174,7 @@ pub struct RiscvBackend {
 
     pending_frame: bool,
     frame_size:    i32,
+    frame_patches: Vec<(usize, bool)>, // (code index, is_prologue) of every frame addi, patched at function end
     frame_active:  bool,
     arg_bytes:     u32,
     next_data:    u32,
@@ -186,11 +194,19 @@ impl RiscvBackend {
             current_line: 0,
             labels:        HashMap::new(),
             label_patches: Vec::new(),
+            long_branches: HashSet::new(),
+            new_long:      HashSet::new(),
+            big_funcs:     HashSet::new(),
+            new_big:       HashSet::new(),
+            func_ord:      0,
+            frame_wide:    false,
+            branch_ord:    0,
             cf_left:  None,
             cf_right: None,
            alloc: RegAlloc::new(),
             pending_frame: false,
             frame_size:    MIN_SPILL_FRAME,
+            frame_patches: Vec::new(),
             frame_active:  false,
             arg_bytes:     0,
             next_data:    BASE_ADDR.wrapping_add(DEFAULT_DATA_OFFSET),
@@ -214,17 +230,50 @@ impl RiscvBackend {
 
     fn compute_frame_size(&self) -> i32 {
         let used = self.alloc.next_spill.saturating_sub(self.alloc.spill_base);
-        let need = (used as i32) + 0x20;
+        let need = self.alloc.spill_base as i32 + (used as i32) + 0x20;
         if need > MIN_SPILL_FRAME { ((need + 15) / 16) * 16 } else { MIN_SPILL_FRAME }
     }
 
     fn ensure_spill_frame(&mut self) {
         if self.pending_frame {
             self.frame_size = self.compute_frame_size();
+            self.frame_wide = self.big_funcs.contains(&self.func_ord);
+            self.frame_patches.push((self.code.len(), true));
             self.emit(addi(SP, SP, -self.frame_size));
+            if self.frame_wide { self.emit(nop()); }
             self.pending_frame = false;
             self.frame_active = true;
         }
+    }
+
+    /// The prologue is emitted before the spill count is known, so patch every
+    /// frame addi of the finished function with the real size (spills used to
+    /// overflow the fixed 0x200 frame into the caller's frame).
+    fn finalize_frame(&mut self) {
+        let size = self.compute_frame_size();
+        if size > 4064 {
+            eprintln!("error: function needs a {}-byte stack frame (limit 4064): too many spilled temporaries", size);
+            std::process::exit(1);
+        }
+        if size > 2032 && !self.frame_wide && !self.frame_patches.is_empty() {
+            self.new_big.insert(self.func_ord);      // recompile with a 2-instruction frame adjust
+        }
+        let (a, b) = if size > 2032 { (2032, size - 2032) } else { (size, 0) };
+        for &(i, pro) in &self.frame_patches {
+            let sg = if pro { -1 } else { 1 };
+            self.code[i] = addi(SP, SP, sg * a);
+            if self.frame_wide { self.code[i + 1] = addi(SP, SP, sg * b); }
+        }
+        self.frame_patches.clear();
+    }
+
+    /// load/store a spill slot; offsets beyond the 12-bit immediate go through `scratch`
+    fn spill_mem(&mut self, load: bool, reg: u32, off: i32, scratch: u32) {
+        let (base, imm) = if off <= 2047 { (SP, off) } else {
+            self.emit(addi(scratch, SP, 2032));
+            (scratch, off - 2032)
+        };
+        if load { self.emit(lw(reg, base, imm)); } else { self.emit(sw(reg, base, imm)); }
     }
 
     fn leave_spill_frame(&mut self) {
@@ -232,6 +281,25 @@ impl RiscvBackend {
             self.emit(addi(SP, SP, self.frame_size));
             self.frame_active = false;
         }
+    }
+
+    /// Epilogue for a `Ret`: releases the frame on THIS path only and keeps
+    /// `frame_active` set, so later `Ret`s in the same function (multiple
+    /// returns) also restore SP.
+    fn emit_ret_epilogue(&mut self) {
+        if self.frame_active {
+            self.frame_patches.push((self.code.len(), false));
+            self.emit(addi(SP, SP, self.frame_size));
+            if self.frame_wide { self.emit(nop()); }
+        }
+    }
+
+    /// Function boundary: just forget the frame, never emit code (dead path).
+    fn forget_frame(&mut self) {
+        self.finalize_frame();
+        self.func_ord += 1;
+        self.frame_wide = false;
+        self.frame_active = false;
     }
 
     fn patch(&mut self, idx: usize, instr: u32) {
@@ -272,7 +340,7 @@ impl RiscvBackend {
                 match self.alloc.alloc(name) {
                     AllocResult::Reg(r) => r,
                     AllocResult::Spill(off) => {
-                        self.emit(lw(temp_reg, SP, off as i32));
+                        self.spill_mem(true, temp_reg, off as i32 + self.arg_bytes as i32, temp_reg);
                         temp_reg
                     }
                 }
@@ -316,7 +384,8 @@ impl RiscvBackend {
                 return;
             }
             if let Some(&off) = self.alloc.spilled.get(name) {
-                self.emit(sw(result_reg, SP, off as i32));
+                let scr = if result_reg == T2 { T1 } else { T2 };
+                self.spill_mem(false, result_reg, off as i32 + self.arg_bytes as i32, scr);
             }
         }
     }
@@ -340,8 +409,17 @@ impl RiscvBackend {
                 PatchKind::Jal { rd } => {
                     self.patch(site, j_type(offset, rd, OP_JAL));
                 }
-                PatchKind::Branch { funct3, rs1, rs2 } => {
-                    self.patch(site, b_type(offset, rs2, rs1, funct3, OP_BRANCH));
+                PatchKind::Branch { funct3, rs1, rs2, ord, long } => {
+                    if long {
+                        // inverted branch hops over a JAL (range +-1MB)
+                        self.patch(site,     b_type(8, rs2, rs1, funct3 ^ 1, OP_BRANCH));
+                        self.patch(site + 1, j_type(offset - 4, ZERO, OP_JAL));
+                    } else {
+                        if offset < -4096 || offset > 4094 {
+                            self.new_long.insert(ord);
+                        }
+                        self.patch(site, b_type(offset, rs2, rs1, funct3, OP_BRANCH));
+                    }
                 }
                 PatchKind::LuiAddi { rd } => {
                     let upper = target_addr.wrapping_add(0x800) >> 12;
@@ -361,8 +439,12 @@ impl RiscvBackend {
 
     fn emit_branch_patch(&mut self, funct3: u32, rs1: u32, rs2: u32, label: &str) {
         let site = self.code.len();
+        let ord = self.branch_ord;
+        self.branch_ord += 1;
+        let long = self.long_branches.contains(&ord);
         self.emit(0);
-        self.label_patches.push((site, label.to_string(), PatchKind::Branch { funct3, rs1, rs2 }));
+        if long { self.emit(0); }
+        self.label_patches.push((site, label.to_string(), PatchKind::Branch { funct3, rs1, rs2, ord, long }));
     }
 
 
@@ -406,6 +488,7 @@ impl RiscvBackend {
             self.emit_instr(instr);
         }
 
+        self.finalize_frame();
         self.resolve_patches();
     }
 
@@ -422,7 +505,7 @@ impl RiscvBackend {
                 if let Some(Operand::Label(name)) = instr.operands.first() {
                     self.register_label(name);
                     if name.starts_with("main_entry") {
-                        self.leave_spill_frame();
+                        self.forget_frame();
                         self.alloc.reset();
                         self.pending_frame = true;
                         self.frame_active  = false;
@@ -433,7 +516,7 @@ impl RiscvBackend {
 
                IrOp::Mf => {
                 if let Some(Operand::Label(name)) = instr.operands.first() {
-                    self.leave_spill_frame();
+                    self.forget_frame();
                     self.register_label(name);
                     self.alloc.reset();
                     self.pending_frame = true;
@@ -656,28 +739,31 @@ impl RiscvBackend {
                 self.writeback_if_spilled(&instr.operands[0], dst);
             }
 
-           IrOp::Cal => {
+         IrOp::Cal => {
                 if let Some(Operand::Label(label)) = instr.operands.first() {
                     if label.is_empty() { return; }
 
                     let adj = self.arg_bytes as i32;
 
+                    // Fixed slot for RA inside the caller's frame (below spill_base 0x100)
+                    const RA_SLOT: i32 = 0x3C;
+
                     let mut saved: Vec<(u32, i32)> = Vec::new();
-                    let mut used = HashSet::new();
+                    let mut regs_used: Vec<u32> = self.alloc.map.values().copied().collect();
+                    regs_used.sort_unstable();
+                    regs_used.dedup();
                     let mut off: i32 = 0x40;
-                    for &reg in self.alloc.map.values() {
-                        if used.insert(reg) {
-                            saved.push((reg, off));
-                            off += 4;
-                        }
-                    }
+                    for reg in regs_used { saved.push((reg, off)); off += 4; }
+
                     for &(reg, o) in &saved {
                         self.emit(sw(reg, SP, o));
                     }
 
+                    // Save return address in the caller's frame (not on GP).
                     self.emit(addi(GP, GP, -4));
                     self.emit(sw(RA, GP, 0));
                     self.emit_jal_patch(RA, label);
+                    // Callee has popped args: SP is +adj vs pre-call-after-pushes.
                     self.emit(lw(RA, GP, 0));
                     self.emit(addi(GP, GP, 4));
 
@@ -694,7 +780,7 @@ impl RiscvBackend {
                     let src = self.operand_to_reg(op, A0);
                     if src != A0 { self.emit(mv(A0, src)); }
                 }
-                self.leave_spill_frame();
+                self.emit_ret_epilogue();
                 self.emit(jr(RA));
             }
 
@@ -776,6 +862,35 @@ impl RiscvBackend {
 
 impl Backend for RiscvBackend {
     fn compile(&mut self, module: &IrModule) -> Vec<u8> {
+        // Conditional branches only reach +-4KB. Compile; if some branch was out of range,
+        // compile again with those branches emitted in the long form (deterministic ordinals).
+        self.long_branches.clear();
+        self.big_funcs.clear();
+        loop {
+            self.new_long.clear();
+            self.new_big.clear();
+            let out = self.compile_once(module);
+            if self.new_long.is_empty() && self.new_big.is_empty() {
+                return out;
+            }
+            let add: Vec<usize> = self.new_long.iter().copied().collect();
+            self.long_branches.extend(add);
+            let addb: Vec<usize> = self.new_big.iter().copied().collect();
+            self.big_funcs.extend(addb);
+        }
+    }
+
+    fn get_source_map(&self) -> Vec<SourceMapEntry> {
+        self.source_map.clone()
+    }
+}
+
+impl RiscvBackend {
+    fn compile_once(&mut self, module: &IrModule) -> Vec<u8> {
+        self.branch_ord = 0;
+        self.func_ord = 0;
+        self.frame_wide = false;
+        self.frame_patches.clear();
         self.code.clear();
         self.source_map.clear();
         self.labels.clear();
@@ -842,7 +957,4 @@ impl Backend for RiscvBackend {
             .collect()
     }
 
-    fn get_source_map(&self) -> Vec<SourceMapEntry> {
-        self.source_map.clone()
-    }
 }

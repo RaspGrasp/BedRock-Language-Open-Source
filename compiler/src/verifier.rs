@@ -214,6 +214,11 @@ impl Verifier {
                 self.define_var(name, kind.clone(), true, false);
             }
 
+            Statement::StringDefine(name, _s) => {
+                // String literals become global labels pointing to rodata
+                self.define_var(name, TypeKind::Unknown, true, false);
+            }
+
             Statement::Assignment(name, expr) => {
                 let expr_type = self.type_of_expr(expr);
                 self.check_expr(expr);

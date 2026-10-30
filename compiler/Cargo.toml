@@ -1,6 +1,6 @@
 [package]
 name = "bedrockco"
-version = "1.0.1-foundation"
+version = "1.0.2-foundation"
 edition = "2021"
 description = "BedRock multi-target compiler (MIPS / RISC-V / x86-64)"
 license = "MIT"

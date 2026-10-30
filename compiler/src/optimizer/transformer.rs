@@ -92,7 +92,10 @@ other => other,
         body.into_iter().map(|s| self.transform_stmt(s)).collect()
     }
 
+    // LICM is disabled: the old version dropped hoisted statements of `while` loops and re-ran hoisted
+    // code inside an outer infinite `loop {}`. Returning nothing hoisted keeps the loop body intact.
     fn licm(&self, body: Vec<Statement>) -> (Vec<Statement>, Vec<Statement>) {
+        if true { return (Vec::new(), body); }
         let loop_modified = self.collect_modified(&body);
         let mut hoisted = Vec::new();
         let mut remaining = Vec::new();

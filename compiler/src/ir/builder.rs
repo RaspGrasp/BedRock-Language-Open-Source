@@ -41,7 +41,8 @@ impl IrBuilder {
             Statement::FunctionDefine(_, _, _, _) | Statement::IntHandler(_, _) => {
                 funcs.push(stmt);
             }
-            Statement::Root(_, _, _)
+            Statement::Let(_, _, _)
+            | Statement::Root(_, _, _)
             | Statement::ArrayDefine(_, _, _)
             | Statement::StringDefine(_, _)
             | Statement::StructDefine(_, _)

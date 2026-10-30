@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use crate::ast::{Statement, Expression};
 use std::collections::{HashMap, HashSet, BTreeMap};
 
@@ -79,7 +78,7 @@ impl Quantum {
                 end,
             });
         }
-        intervals.sort_by_key(|i| i.start);
+        intervals.sort_by(|a, b| a.start.cmp(&b.start).then_with(|| a.var.0.cmp(&b.var.0)));
         intervals
     }
 
@@ -219,7 +218,7 @@ _ => {}
         &self,
         current: &LiveInterval,
         active: &mut Vec<LiveInterval>,
-        _free_regs: &mut Vec<usize>,
+        free_regs: &mut Vec<usize>,
     ) {
         let expired: Vec<LiveInterval> = active
             .iter()
