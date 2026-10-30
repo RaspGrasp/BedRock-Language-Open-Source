@@ -169,7 +169,7 @@ fn print_version(s: &Style) {
         "{} {} ({})",
         s.bold(NAME),
         s.bright_cyan(&format!("v{VERSION}")),
-        s.dim("foundation + packages")
+        s.dim("(GitHub release 3.2)")
     );
     eprintln!(
         "{}",
