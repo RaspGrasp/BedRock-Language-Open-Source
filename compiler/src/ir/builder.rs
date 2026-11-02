@@ -1,4 +1,4 @@
-use crate::ast::{Statement, Expression};
+use crate::ast::{Statement, Expression, TypeKind};
 use super::{IrModule, IrInstr, IrOp, Operand};
 
 pub struct IrBuilder {
@@ -6,6 +6,9 @@ pub struct IrBuilder {
     label_counter: usize,
     break_labels:  Vec<String>,
     struct_layouts: std::collections::HashMap<String, Vec<(String, usize)>>,
+    gkinds: std::collections::HashMap<String, TypeKind>,   // global variable / array types
+    lkinds: std::collections::HashMap<String, TypeKind>,   // current function: parameters and lets
+    fret:   std::collections::HashMap<String, TypeKind>,   // function return types
 }
 
 impl IrBuilder {
@@ -15,6 +18,9 @@ impl IrBuilder {
             label_counter:  0,
             break_labels:   Vec::new(),
             struct_layouts: std::collections::HashMap::new(),
+            gkinds: std::collections::HashMap::new(),
+            lkinds: std::collections::HashMap::new(),
+            fret:   std::collections::HashMap::new(),
         }
     }
 
@@ -56,13 +62,29 @@ impl IrBuilder {
     }
 
 
+    for stmt in header.iter() {
+        match stmt {
+            Statement::Let(n, _, k) | Statement::Root(n, _, k) | Statement::ArrayDefine(n, _, k) => { self.gkinds.insert(n.clone(), k.clone()); }
+            _ => {}
+        }
+    }
+    for stmt in funcs.iter() {
+        if let Statement::FunctionDefine(n, _, _, k) = stmt { self.fret.insert(n.clone(), k.clone()); }
+    }
+
     let has_main = funcs.iter().any(|s| {
         matches!(s, Statement::FunctionDefine(name, _, _, _) if name == "main")
     });
 
     // 1) globals / roots
     for stmt in &header {
-        self.lower_stmt(stmt, &mut module);
+        // A top-level `let` is a global. Lowered as a plain vreg it was invisible to every function
+        // (each function silently saw its own zero-initialised copy), so treat it like `root`.
+        if let Statement::Let(name, expr, kind) = stmt {
+            self.lower_stmt(&Statement::Root(name.clone(), expr.clone(), kind.clone()), &mut module);
+        } else {
+            self.lower_stmt(stmt, &mut module);
+        }
     }
 
 
@@ -90,6 +112,59 @@ impl IrBuilder {
     module.push(IrInstr::halt());
     module
 }
+    /// Operands that name a variable are read lazily (at the instruction that uses them). When a LATER
+    /// operand contains a call, that call may change a global the earlier operand refers to, so the
+    /// earlier value is copied into a temporary first: operands are evaluated strictly left to right.
+    fn snapshot(&mut self, op: Operand, later: &[&Expression], out: &mut IrModule) -> Operand {
+        if let Operand::VReg(name) = &op {
+            let is_temp = name.len() > 1 && name.starts_with('t') && name[1..].chars().all(|c| c.is_ascii_digit());
+            if !is_temp && name != "__a0" && later.iter().any(|e| Self::has_effects(e)) {
+                let t = self.fresh_vreg();
+                out.push(IrInstr::mov(t.clone(), op));
+                return t;
+            }
+        }
+        op
+    }
+
+    fn is_signed_kind(k: &TypeKind) -> bool {
+        matches!(k, TypeKind::I8 | TypeKind::I16 | TypeKind::I32 | TypeKind::I64)
+    }
+
+    /// Is this expression of a signed integer type? (variables, literals, calls, arrays; anything unknown is unsigned)
+    fn expr_signed(&self, e: &Expression) -> bool {
+        match e {
+            Expression::Number(_, k) => Self::is_signed_kind(k),
+            Expression::Variable(n) => self.lkinds.get(n).or_else(|| self.gkinds.get(n)).map_or(false, Self::is_signed_kind),
+            Expression::ArrayAccess(n, _) => self.gkinds.get(n).map_or(false, Self::is_signed_kind),
+            Expression::Call(n, _) => self.fret.get(n).map_or(false, Self::is_signed_kind),
+            Expression::BinaryOp(l, op, r) => match op.as_str() {
+                "==" | "!=" | "<" | ">" | "<=" | ">=" | "&&" | "||" => false,
+                _ => self.expr_signed(l) || self.expr_signed(r),
+            },
+            _ => false,
+        }
+    }
+
+    /// comparison operator with a `u` suffix for unsigned ordering compares (`<u`, `>=u`, ...)
+    fn cmp_op(&self, op: &str, lhs: &Expression, rhs: &Expression) -> String {
+        if matches!(op, "<" | ">" | "<=" | ">=") && !(self.expr_signed(lhs) || self.expr_signed(rhs)) {
+            format!("{}u", op)
+        } else {
+            op.to_string()
+        }
+    }
+
+    fn has_effects(e: &Expression) -> bool {
+        match e {
+            Expression::Call(_, _) | Expression::Syscall(_) | Expression::FieldAssign(_, _, _) => true,
+            Expression::BinaryOp(l, _, r) => Self::has_effects(l) || Self::has_effects(r),
+            Expression::Peek(x) | Expression::Inb(x) => Self::has_effects(x),
+            Expression::ArrayAccess(_, x) => Self::has_effects(x),
+            _ => false,
+        }
+    }
+
     fn fresh_vreg(&mut self) -> Operand {
         let n = self.vreg_counter;
         self.vreg_counter += 1;
@@ -105,9 +180,12 @@ impl IrBuilder {
     fn lower_stmt(&mut self, stmt: &Statement, out: &mut IrModule) {
         match stmt {
 
-            Statement::Let(name, expr, _) => {
+            Statement::Let(name, expr, kind) => {
+                self.lkinds.insert(name.clone(), kind.clone());
                 let src = self.lower_expr(expr, out);
-                out.push(IrInstr::mov(Operand::VReg(name.clone()), src));
+                let dst = Operand::VReg(name.clone());
+                out.push(IrInstr::mov(dst.clone(), src));
+                self.emit_narrow_trunc(&dst, kind, out);
             }
 
             Statement::Root(name, expr, _) => {
@@ -117,20 +195,33 @@ impl IrBuilder {
             Statement::Assignment(name, expr) => {
                 let src = self.lower_expr(expr, out);
                 let safe_name = name.replace('.', "__");
-                out.push(IrInstr::mov(Operand::VReg(safe_name), src));
+                let dst = Operand::VReg(safe_name.clone());
+                out.push(IrInstr::mov(dst.clone(), src));
+                if let Some(k) = self.lkinds.get(&safe_name).cloned()
+                    .or_else(|| self.lkinds.get(name).cloned())
+                    .or_else(|| self.gkinds.get(name).cloned())
+                {
+                    self.emit_narrow_trunc(&dst, &k, out);
+                }
             }
 
             Statement::ArrayAssign(name, idx_expr, val_expr) => {
-                let idx      = self.lower_expr(idx_expr, out);
+                let idx0     = self.lower_expr(idx_expr, out);
+                let idx0     = self.snapshot(idx0, &[val_expr], out);
                 let val      = self.lower_expr(val_expr, out);
+                let idx      = self.fresh_vreg();               // word index -> byte offset (x4)
+                out.push(IrInstr::add(idx.clone(), idx0.clone(), idx0));
+                out.push(IrInstr::add(idx.clone(), idx.clone(), idx.clone()));
                 let addr_reg = self.fresh_vreg();
                 out.push(IrInstr::add(addr_reg.clone(), Operand::Label(name.clone()), idx));
                 out.push(IrInstr::bri(val, addr_reg));
             }
 
             Statement::ArrayDefine(name, values, _) => {
+                // elements are consecutive 32-bit words; the array symbol is element 0
                 for (i, &v) in values.iter().enumerate() {
-                    out.push(IrInstr::df(&format!("{}__{}", name, i), v));
+                    let sym = if i == 0 { name.clone() } else { format!("{}__{}", name, i) };
+                    out.push(IrInstr::df(&sym, v));
                 }
             }
 
@@ -144,6 +235,7 @@ impl IrBuilder {
 
             Statement::Poke(addr_expr, val_expr) => {
                 let addr = self.lower_expr(addr_expr, out);
+                let addr = self.snapshot(addr, &[val_expr], out);
                 let val  = self.lower_expr(val_expr, out);
                 out.push(IrInstr::bri(val, addr));
             }
@@ -155,6 +247,8 @@ impl IrBuilder {
             }
                        
             Statement::FunctionDefine(name, params, body, _) => {
+                self.lkinds.clear();
+                for (pn, pk) in params { self.lkinds.insert(pn.clone(), pk.clone()); }
                 out.push(IrInstr::mf(name));
                 for (pname, _) in params {
                     out.push(IrInstr::pop(Operand::VReg(pname.clone())));
@@ -297,6 +391,24 @@ impl IrBuilder {
         }
     }
 
+
+    /// Truncate/wrap to the declared width after writes (u8/u16/i8/i16).
+    fn emit_narrow_trunc(&mut self, dst: &Operand, kind: &TypeKind, out: &mut IrModule) {
+        let mask = match kind {
+            TypeKind::U8 | TypeKind::I8 => Some(0xffu64),
+            TypeKind::U16 | TypeKind::I16 => Some(0xffffu64),
+            TypeKind::Bool => Some(0x1u64),
+            _ => None,
+        };
+        if let Some(m) = mask {
+            out.push(IrInstr::and(
+                dst.clone(),
+                dst.clone(),
+                Operand::Imm(m),
+            ));
+        }
+    }
+
     fn lower_expr(&mut self, expr: &Expression, out: &mut IrModule) -> Operand {
         match expr {
 
@@ -314,6 +426,7 @@ impl IrBuilder {
                 }
 
                 let l = self.lower_expr(lhs, out);
+                let l = self.snapshot(l, &[&**rhs], out);
                 let r = self.lower_expr(rhs, out);
                 let dest = self.fresh_vreg();
                 let instr = match op.as_str() {
@@ -328,7 +441,8 @@ impl IrBuilder {
                     "<<" => IrInstr::shl(dest.clone(), l, r),
                     ">>" => IrInstr::shr(dest.clone(), l, r),
                     "==" | "!=" | "<" | ">" | "<=" | ">=" => {
-                        return self.lower_comparison(l, op, r, out);
+                        let cop = self.cmp_op(op, lhs, rhs);
+                        return self.lower_comparison(l, &cop, r, out);
                     }
                     unknown => {
                         eprintln!("[IR ERROR] Unknown binary op: {}", unknown);
@@ -354,7 +468,10 @@ impl IrBuilder {
             }
 
             Expression::ArrayAccess(name, idx_expr) => {
-                let idx  = self.lower_expr(idx_expr, out);
+                let idx0 = self.lower_expr(idx_expr, out);
+                let idx  = self.fresh_vreg();                   // word index -> byte offset (x4)
+                out.push(IrInstr::add(idx.clone(), idx0.clone(), idx0));
+                out.push(IrInstr::add(idx.clone(), idx.clone(), idx.clone()));
                 let addr = self.fresh_vreg();
                 out.push(IrInstr::add(addr.clone(), Operand::Label(name.clone()), idx));
                 let dest = self.fresh_vreg();
@@ -417,8 +534,11 @@ impl IrBuilder {
         // Evaluate ALL arguments first (including nested calls), then push.
         // Avoids interleaving outer pushes with inner call frames on the stack.
         let mut ops = Vec::new();
-        for arg in args {
-            ops.push(self.lower_expr(arg, out));
+        for (i, arg) in args.iter().enumerate() {
+            let o = self.lower_expr(arg, out);
+            let later: Vec<&Expression> = args[i + 1..].iter().collect();
+            let o = self.snapshot(o, &later, out);
+            ops.push(o);
         }
         for op in ops.iter().rev() {
             out.push(IrInstr::psh(op.clone()));
@@ -436,8 +556,10 @@ impl IrBuilder {
                 if matches!(op.as_str(), "==" | "!=" | "<" | ">" | "<=" | ">=") =>
             {
                 let l   = self.lower_expr(lhs, out);
+                let l   = self.snapshot(l, &[&**rhs], out);
                 let r   = self.lower_expr(rhs, out);
-                let inv = invert_cond(op);
+                let cop = self.cmp_op(op, lhs, rhs);
+                let inv = invert_cond(&cop);
                 (IrInstr::cf(l, r), inv)
             }
             other => {
@@ -520,6 +642,10 @@ fn invert_cond(op: &str) -> String {
         ">"  => "<=",
         "<=" => ">",
         ">=" => "<",
+        "<u"  => ">=u",
+        ">u"  => "<=u",
+        "<=u" => ">u",
+        ">=u" => "<u",
         other => {
             eprintln!("[IR WARNING] Unknown condition '{}', defaulting to !=", other);
             "!="

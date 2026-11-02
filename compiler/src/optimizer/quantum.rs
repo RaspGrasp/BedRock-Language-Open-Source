@@ -46,9 +46,12 @@ impl Quantum {
     }
 
     pub fn run(&mut self, program: Vec<Statement>) -> Vec<Statement> {
+        // -O3 statement "pipeline scheduling" is DISABLED: reorder_for_pipeline moves statements within a
+        // block without any data/side-effect dependency analysis (reads before writes, pokes, calls,
+        // even returns could be reordered), which changed program results. The register map is still
+        // computed for callers of get_register_map().
         let intervals = self.compute_intervals(&program);
-        let reg_map = self.allocate_registers(intervals);
-        let program = self.schedule(program, &reg_map);
+        let _reg_map = self.allocate_registers(intervals);
         program
     }
 

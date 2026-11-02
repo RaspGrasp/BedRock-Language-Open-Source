@@ -19,22 +19,14 @@ impl Transformer {
                 Statement::FunctionDefine(name, params, body, ret)
             }
             Statement::Loop(body) => {
-                let (hoisted, body) = self.licm(body);
                 let body = self.transform_body(body);
-                if hoisted.is_empty() {
-                    Statement::Loop(body)
-                } else {
-                    let mut outer = hoisted;
-                    outer.push(Statement::Loop(body));
-                    Statement::Loop(outer)
-                }
+                Statement::Loop(body)
             }
-Statement::While(cond, body) => {
-    let cond = self.strength_reduce_expr(cond);
-    let (_, body) = self.licm(body);
-    let body = self.transform_body(body);
-    Statement::While(cond, body)
-}
+            Statement::While(cond, body) => {
+                let cond = self.strength_reduce_expr(cond);
+                let body = self.transform_body(body);
+                Statement::While(cond, body)
+            }
             Statement::If(cond, then_b, else_b) => {
                 let cond = self.strength_reduce_expr(cond);
                 let then_b = self.transform_body(then_b);
@@ -89,17 +81,37 @@ other => other,
     }
 
     fn transform_body(&self, body: Vec<Statement>) -> Vec<Statement> {
-        body.into_iter().map(|s| self.transform_stmt(s)).collect()
+        let mut out: Vec<Statement> = Vec::new();
+        for stmt in body {
+            match stmt {
+                Statement::While(cond, wbody) => {
+                    let (hoisted, rest) = self.licm(wbody);
+                    let cond = self.strength_reduce_expr(cond);
+                    let rest = self.transform_body(rest);
+                    for h in hoisted {
+                        out.push(self.transform_stmt(h));
+                    }
+                    out.push(Statement::While(cond, rest));
+                }
+                Statement::Loop(lbody) => {
+                    let (hoisted, rest) = self.licm(lbody);
+                    let rest = self.transform_body(rest);
+                    for h in hoisted {
+                        out.push(self.transform_stmt(h));
+                    }
+                    out.push(Statement::Loop(rest));
+                }
+                other => out.push(self.transform_stmt(other)),
+            }
+        }
+        out
     }
 
-    // LICM is disabled: the old version dropped hoisted statements of `while` loops and re-ran hoisted
-    // code inside an outer infinite `loop {}`. Returning nothing hoisted keeps the loop body intact.
+    /// Safe LICM: hoist pure lets/assigns before the loop (not drop, not outer infinite loop).
     fn licm(&self, body: Vec<Statement>) -> (Vec<Statement>, Vec<Statement>) {
-        if true { return (Vec::new(), body); }
         let loop_modified = self.collect_modified(&body);
         let mut hoisted = Vec::new();
         let mut remaining = Vec::new();
-
         for stmt in body {
             if self.is_hoistable(&stmt, &loop_modified) {
                 hoisted.push(stmt);
@@ -107,7 +119,6 @@ other => other,
                 remaining.push(stmt);
             }
         }
-
         (hoisted, remaining)
     }
 
@@ -187,8 +198,9 @@ other => other,
                         }
                         Expression::BinaryOp(Box::new(left), op, Box::new(right))
                     }
+                    // Only constant / constant power-of-two (unsigned-safe). Variables keep Div/Rem.
                     "/" => {
-                        if let Expression::Number(v, _) = &right {
+                        if let (Expression::Number(_, _), Expression::Number(v, _)) = (&left, &right) {
                             if *v > 0 && v.is_power_of_two() {
                                 let shift = v.trailing_zeros() as u64;
                                 return Expression::BinaryOp(
@@ -201,7 +213,7 @@ other => other,
                         Expression::BinaryOp(Box::new(left), op, Box::new(right))
                     }
                     "%" => {
-                        if let Expression::Number(v, _) = &right {
+                        if let (Expression::Number(_, _), Expression::Number(v, _)) = (&left, &right) {
                             if *v > 0 && v.is_power_of_two() {
                                 let mask = v - 1;
                                 return Expression::BinaryOp(

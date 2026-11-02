@@ -495,7 +495,7 @@ impl RiscvBackend {
       fn emit_instr(&mut self, instr: &crate::ir::IrInstr) {
     
         match &instr.op {
-            IrOp::Mk | IrOp::Mf | IrOp::Pop | IrOp::Comment | IrOp::Rdf | IrOp::StrData => {}
+            IrOp::Mk | IrOp::Mf | IrOp::Pop | IrOp::Comment | IrOp::Rdf => {}
             _ => self.ensure_spill_frame(),
         }
 
@@ -680,8 +680,40 @@ impl RiscvBackend {
                 self.emit(xori(dst, src, -1)); // bitwise NOT
                 self.writeback_if_spilled(&instr.operands[0], dst);
             }
-            IrOp::Syscall | IrOp::StrData => {
+            IrOp::Syscall => {
                 // OS syscalls are x86-hosted only for now
+            }
+
+            IrOp::StrData => {
+                // Place a NUL-terminated string at the next DATA address and
+                // emit stores so freestanding images initialize SRAM.
+                if instr.operands.len() < 2 { return; }
+                let name = match &instr.operands[0] {
+                    Operand::Label(n) => n.clone(),
+                    _ => return,
+                };
+                let s = match &instr.operands[1] {
+                    Operand::Str(s) => s.clone(),
+                    _ => return,
+                };
+                let mut bytes: Vec<u8> = s.into_bytes();
+                bytes.push(0);
+                while bytes.len() % 4 != 0 { bytes.push(0); }
+                let base = self.next_data;
+                self.data_symbols.insert(name, base);
+                let mut off = 0u32;
+                while off < bytes.len() as u32 {
+                    let i = off as usize;
+                    let word = (bytes[i] as u32)
+                        | ((bytes.get(i+1).copied().unwrap_or(0) as u32) << 8)
+                        | ((bytes.get(i+2).copied().unwrap_or(0) as u32) << 16)
+                        | ((bytes.get(i+3).copied().unwrap_or(0) as u32) << 24);
+                    self.emit_li(T1, base + off);
+                    self.emit_li(T2, word);
+                    self.emit(sw(T2, T1, 0));
+                    off += 4;
+                }
+                self.next_data = base + bytes.len() as u32;
             }
 
             IrOp::Cf => {
@@ -710,6 +742,11 @@ impl RiscvBackend {
                     ">=" => self.emit_branch_patch(0x5, l, r, &label), // BGE
                     ">"  => self.emit_branch_patch(0x4, r, l, &label),
                     "<=" => self.emit_branch_patch(0x5, r, l, &label),
+                    // unsigned ordering compares (u8/u16/u32/bool operands): BLTU / BGEU
+                    "<u"  => self.emit_branch_patch(0x6, l, r, &label),
+                    ">=u" => self.emit_branch_patch(0x7, l, r, &label),
+                    ">u"  => self.emit_branch_patch(0x6, r, l, &label),
+                    "<=u" => self.emit_branch_patch(0x7, r, l, &label),
                     _ => {
                         eprintln!("[RISCV IR] Unknown JF condition: '{}'", cond);
                         self.emit_branch_patch(0x1, l, r, &label);
@@ -740,8 +777,17 @@ impl RiscvBackend {
             }
 
          IrOp::Cal => {
-                if let Some(Operand::Label(label)) = instr.operands.first() {
+                // `call(f)` with a pointer held in a variable / array element / expression is an
+                // INDIRECT call (it used to be silently dropped: only label operands were handled).
+                let indirect = matches!(instr.operands.first(), Some(Operand::VReg(_)));
+                let dummy = Operand::Label(String::new());
+                let first = instr.operands.first().unwrap_or(&dummy);
+                let label_owned = match first { Operand::Label(l) => l.clone(), _ => "<indirect>".to_string() };
+                if instr.operands.first().is_some() {
+                    let label = &label_owned;
                     if label.is_empty() { return; }
+                    let ptr_reg = if indirect { Some(self.operand_to_reg(first, T0)) } else { None };
+                    if let Some(pr) = ptr_reg { if pr != T0 { self.emit(mv(T0, pr)); } }
 
                     let adj = self.arg_bytes as i32;
 
@@ -762,7 +808,7 @@ impl RiscvBackend {
                     // Save return address in the caller's frame (not on GP).
                     self.emit(addi(GP, GP, -4));
                     self.emit(sw(RA, GP, 0));
-                    self.emit_jal_patch(RA, label);
+                    if indirect { self.emit(i_type(0, T0, 0x0, RA, OP_JALR)); } else { self.emit_jal_patch(RA, label); }
                     // Callee has popped args: SP is +adj vs pre-call-after-pushes.
                     self.emit(lw(RA, GP, 0));
                     self.emit(addi(GP, GP, 4));
@@ -810,8 +856,17 @@ impl RiscvBackend {
             }
 
             IrOp::Asm => {
-                if let Some(Operand::Str(hex)) = instr.operands.first() {
-                    if let Ok(word) = u32::from_str_radix(hex.trim(), 16) { self.emit(word); }
+                // Accept one or more 32-bit words as hex (space/comma separated).
+                if let Some(Operand::Str(raw)) = instr.operands.first() {
+                    for tok in raw.split(|c: char| c.is_whitespace() || c == ',' || c == ';') {
+                        let t = tok.trim().trim_start_matches("0x").trim_start_matches("0X");
+                        if t.is_empty() { continue; }
+                        if let Ok(word) = u32::from_str_radix(t, 16) {
+                            self.emit(word);
+                        } else {
+                            eprintln!("[RISCV] asm: bad hex token '{}'", tok);
+                        }
+                    }
                 }
             }
 
@@ -831,9 +886,18 @@ impl RiscvBackend {
             }
 
             IrOp::SaveCtx => {
+                // Save a fixed callee set + RA/SP into a named 40-byte buffer in DATA.
                 if let Some(Operand::Label(name)) = instr.operands.first() {
-                    let base = *self.data_symbols.get(name).unwrap_or(&self.next_data);
-                    let regs: &[u32] = &[8,9,18,19,20,21,22,23,1,2];
+                    let base = if let Some(&b) = self.data_symbols.get(name) {
+                        b
+                    } else {
+                        let b = self.next_data;
+                        self.data_symbols.insert(name.clone(), b);
+                        self.next_data = b + 40;
+                        b
+                    };
+                    // s0,s1,s2..s7, ra, sp  (ABI-ish snapshot for cooperative IRQ stubs)
+                    let regs: &[u32] = &[8, 9, 18, 19, 20, 21, 22, 23, 1, 2];
                     for (i, &r) in regs.iter().enumerate() {
                         let addr = base + (i as u32 * 4);
                         self.emit_li(T2, addr);
@@ -844,8 +908,15 @@ impl RiscvBackend {
 
             IrOp::RestoreCtx => {
                 if let Some(Operand::Label(name)) = instr.operands.first() {
-                    let base = *self.data_symbols.get(name).unwrap_or(&self.next_data);
-                    let regs: &[u32] = &[8,9,18,19,20,21,22,23,1,2];
+                    let base = if let Some(&b) = self.data_symbols.get(name) {
+                        b
+                    } else {
+                        let b = self.next_data;
+                        self.data_symbols.insert(name.clone(), b);
+                        self.next_data = b + 40;
+                        b
+                    };
+                    let regs: &[u32] = &[8, 9, 18, 19, 20, 21, 22, 23, 1, 2];
                     for (i, &r) in regs.iter().enumerate() {
                         let addr = base + (i as u32 * 4);
                         self.emit_li(T2, addr);

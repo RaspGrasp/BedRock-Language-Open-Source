@@ -214,6 +214,11 @@ impl Verifier {
                 self.define_var(name, kind.clone(), true, false);
             }
 
+            Statement::ArrayDefine(name, _vals, kind) => {
+                // arrays live in static data; declaring them is what lets `name[i]` pass the checks below
+                self.define_var(name, kind.clone(), true, false);
+            }
+
             Statement::StringDefine(name, _s) => {
                 // String literals become global labels pointing to rodata
                 self.define_var(name, TypeKind::Unknown, true, false);

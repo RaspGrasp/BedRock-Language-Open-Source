@@ -686,6 +686,10 @@ impl X86Backend {
                     ">=" => 0xD, // JGE
                     ">" => 0xF,  // JG
                     "<=" => 0xE, // JLE
+                    "<u" => 0x2,  // JB  (unsigned)
+                    ">=u" => 0x3, // JAE
+                    ">u" => 0x7,  // JA
+                    "<=u" => 0x6, // JBE
                     _ => 0x5,
                 };
                 let at = self.emit_jcc_rel_placeholder(cc);

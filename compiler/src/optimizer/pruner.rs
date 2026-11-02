@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 pub struct Pruner {
     constants: HashMap<String, u64>,
     locals: HashSet<String>,
+    kinds: HashMap<String, TypeKind>,   // declared type of every tracked local / parameter
     in_fn: bool,
 }
 
@@ -12,6 +13,7 @@ impl Pruner {
         Pruner {
             constants: HashMap::new(),
             locals: HashSet::new(),
+            kinds: HashMap::new(),
             in_fn: false,
         }
     }
@@ -206,7 +208,7 @@ _ => {}
         match stmt {
             Statement::Let(name, expr, kind) => {
                 let folded = self.fold_expr(expr);
-                if self.in_fn { self.locals.insert(name.clone()); }
+                if self.in_fn { self.locals.insert(name.clone()); self.kinds.insert(name.clone(), kind.clone()); }
                 self.set_const(&name, &folded);
                 out.push(Statement::Let(name, folded, kind));
             }
@@ -269,12 +271,14 @@ _ => {}
             Statement::FunctionDefine(name, params, body, ret) => {
                 let saved_c = std::mem::take(&mut self.constants);
                 let saved_l = std::mem::take(&mut self.locals);
+                let saved_k = std::mem::take(&mut self.kinds);
                 let saved_f = self.in_fn;
                 self.in_fn = true;
-                for (p, _) in &params { self.locals.insert(p.clone()); }
+                for (p, pk) in &params { self.locals.insert(p.clone()); self.kinds.insert(p.clone(), pk.clone()); }
                 let body_folded = self.fold_block(body);
                 self.constants = saved_c;
                 self.locals = saved_l;
+                self.kinds = saved_k;
                 self.in_fn = saved_f;
                 out.push(Statement::FunctionDefine(name, params, body_folded, ret));
             }
@@ -310,14 +314,14 @@ _ => {}
         match expr {
             Expression::Variable(ref name) => {
                 if let Some(&v) = self.constants.get(name) {
-                    return Expression::Number(v, TypeKind::Unknown);
+                    return Expression::Number(v, self.kinds.get(name).cloned().unwrap_or(TypeKind::Unknown));
                 }
                 expr
             }
             Expression::BinaryOp(left, op, right) => {
                 let l = self.fold_expr(*left);
                 let r = self.fold_expr(*right);
-                if let (Expression::Number(lv, lk), Expression::Number(rv, _)) = (&l, &r) {
+                if let (Expression::Number(lv, lk), Expression::Number(rv, rk)) = (&l, &r) {
                     let lv = *lv;
                     let rv = *rv;
                     let kind = lk.clone();
@@ -342,12 +346,20 @@ _ => {}
                         "&" => return Expression::Number(lv & rv, kind),
                         "|" => return Expression::Number(lv | rv, kind),
                         "^" => return Expression::Number(lv ^ rv, kind),
-                        "==" => return Expression::Number(if lv == rv { 1 } else { 0 }, TypeKind::Bool),
-                        "!=" => return Expression::Number(if lv != rv { 1 } else { 0 }, TypeKind::Bool),
-                        ">" => return Expression::Number(if lv > rv { 1 } else { 0 }, TypeKind::Bool),
-                        "<" => return Expression::Number(if lv < rv { 1 } else { 0 }, TypeKind::Bool),
-                        ">=" => return Expression::Number(if lv >= rv { 1 } else { 0 }, TypeKind::Bool),
-                        "<=" => return Expression::Number(if lv <= rv { 1 } else { 0 }, TypeKind::Bool),
+                        // ordering compares are signed only for i8..i64 operands, unsigned otherwise (same rule as the code generator)
+                        "==" => return Expression::Number(if m(lv) == m(rv) { 1 } else { 0 }, TypeKind::Bool),
+                        "!=" => return Expression::Number(if m(lv) != m(rv) { 1 } else { 0 }, TypeKind::Bool),
+                        ">" | "<" | ">=" | "<=" => {
+                            let (a, b) = (m(lv) as u32, m(rv) as u32);
+                            let sg = matches!(rk, TypeKind::I8 | TypeKind::I16 | TypeKind::I32 | TypeKind::I64);
+                            let t = if sg {
+                                let (a, b) = (a as i32, b as i32);
+                                match op.as_str() { ">" => a > b, "<" => a < b, ">=" => a >= b, _ => a <= b }
+                            } else {
+                                match op.as_str() { ">" => a > b, "<" => a < b, ">=" => a >= b, _ => a <= b }
+                            };
+                            return Expression::Number(if t { 1 } else { 0 }, TypeKind::Bool);
+                        }
                         _ => {}
                     }
                 }

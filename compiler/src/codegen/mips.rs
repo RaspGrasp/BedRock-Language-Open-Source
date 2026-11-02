@@ -581,6 +581,22 @@ IrOp::Shr => {
                         self.emit(0x0000002A | (r << 21) | (l << 16) | (1 << 11));
                         self.emit_branch_patch(0x10000000, 1, 0, &label);
                     }
+                    "<u" => {
+                        self.emit(0x0000002B | (l << 21) | (r << 16) | (1 << 11));
+                        self.emit_branch_patch(0x14000000, 1, 0, &label);
+                    }
+                    ">=u" => {
+                        self.emit(0x0000002B | (l << 21) | (r << 16) | (1 << 11));
+                        self.emit_branch_patch(0x10000000, 1, 0, &label);
+                    }
+                    ">u" => {
+                        self.emit(0x0000002B | (r << 21) | (l << 16) | (1 << 11));
+                        self.emit_branch_patch(0x14000000, 1, 0, &label);
+                    }
+                    "<=u" => {
+                        self.emit(0x0000002B | (r << 21) | (l << 16) | (1 << 11));
+                        self.emit_branch_patch(0x10000000, 1, 0, &label);
+                    }
                     _ => {
                         eprintln!("[MIPS IR] Unknown JF condition: '{}'", cond);
                         self.emit_branch_patch(0x14000000, l, r, &label);
