@@ -1,8 +1,3 @@
-## Future ISEF 2027 Competitor
- This project is pretend to be in ISEF Egypt 2027 local exhibitions  
-
-
-
 ------------------------------------------------------------------------------------------
 # BedRock Programming Language
 
