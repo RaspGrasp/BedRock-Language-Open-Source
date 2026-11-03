@@ -109,6 +109,9 @@ other => other,
 
     /// Safe LICM: hoist pure lets/assigns before the loop (not drop, not outer infinite loop).
     fn licm(&self, body: Vec<Statement>) -> (Vec<Statement>, Vec<Statement>) {
+        // DISABLED: hoisting a `let` is unsound when the loop reads the variable before the let,
+        // when the loop runs zero times, or when the let sits inside a nested loop (see regress.py licm_*).
+        if true { return (Vec::new(), body); }
         let loop_modified = self.collect_modified(&body);
         let mut hoisted = Vec::new();
         let mut remaining = Vec::new();
@@ -200,8 +203,9 @@ other => other,
                     }
                     // Only constant / constant power-of-two (unsigned-safe). Variables keep Div/Rem.
                     "/" => {
-                        if let (Expression::Number(_, _), Expression::Number(v, _)) = (&left, &right) {
-                            if *v > 0 && v.is_power_of_two() {
+                        if let (Expression::Number(_, lk), Expression::Number(v, _)) = (&left, &right) {
+                            let sgn = matches!(lk, TypeKind::I8 | TypeKind::I16 | TypeKind::I32 | TypeKind::I64);
+                            if !sgn && *v > 0 && v.is_power_of_two() {
                                 let shift = v.trailing_zeros() as u64;
                                 return Expression::BinaryOp(
                                     Box::new(left),
@@ -213,8 +217,9 @@ other => other,
                         Expression::BinaryOp(Box::new(left), op, Box::new(right))
                     }
                     "%" => {
-                        if let (Expression::Number(_, _), Expression::Number(v, _)) = (&left, &right) {
-                            if *v > 0 && v.is_power_of_two() {
+                        if let (Expression::Number(_, lk), Expression::Number(v, _)) = (&left, &right) {
+                            let sgn = matches!(lk, TypeKind::I8 | TypeKind::I16 | TypeKind::I32 | TypeKind::I64);
+                            if !sgn && *v > 0 && v.is_power_of_two() {
                                 let mask = v - 1;
                                 return Expression::BinaryOp(
                                     Box::new(left),

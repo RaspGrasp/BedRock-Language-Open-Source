@@ -630,8 +630,9 @@ impl RiscvBackend {
                 let dst = self.dest_reg(&instr.operands[0]);
                 let l   = self.operand_to_reg(&instr.operands[1], T1);
                 let r   = self.operand_to_reg(&instr.operands[2], T2);
-                // DIVU: unsigned division (language defaults to u32)
-                self.emit(r_type(0x01, r, l, 0x5, dst, OP_REG));
+                // DIV (signed) when the IR marks it, else DIVU (language defaults to u32)
+                let f3 = if instr.operands.len() > 3 { 0x4 } else { 0x5 };
+                self.emit(r_type(0x01, r, l, f3, dst, OP_REG));
                 self.writeback_if_spilled(&instr.operands[0], dst);
             }
 
@@ -640,8 +641,9 @@ impl RiscvBackend {
                 let dst = self.dest_reg(&instr.operands[0]);
                 let l   = self.operand_to_reg(&instr.operands[1], T1);
                 let r   = self.operand_to_reg(&instr.operands[2], T2);
-                // REMU: unsigned remainder
-                self.emit(r_type(0x01, r, l, 0x7, dst, OP_REG));
+                // REM (signed) when marked, else REMU
+                let f3 = if instr.operands.len() > 3 { 0x6 } else { 0x7 };
+                self.emit(r_type(0x01, r, l, f3, dst, OP_REG));
                 self.writeback_if_spilled(&instr.operands[0], dst);
             }
 
@@ -664,10 +666,15 @@ impl RiscvBackend {
                 let dst = self.dest_reg(&instr.operands[0]);
                 let l   = self.operand_to_reg(&instr.operands[1], T1);
                 match &instr.operands[2] {
-                    Operand::Imm(sa) => self.emit(i_type((*sa as i32) & 31, l, 0x5, dst, OP_IMM)), // SRLI+
+                    Operand::Imm(sa) => {
+                        // SRAI when signed (funct7 0x20 lives in imm[11:5])
+                        let hi = if instr.operands.len() > 3 { 0x400 } else { 0 };
+                        self.emit(i_type(((*sa as i32) & 31) | hi, l, 0x5, dst, OP_IMM));
+                    }
                     op2 => {
                         let r = self.operand_to_reg(op2, T2);
-                        self.emit(r_type(0x00, r, l, 0x5, dst, OP_REG)); // SRL+
+                        let f7 = if instr.operands.len() > 3 { 0x20 } else { 0x00 };
+                        self.emit(r_type(f7, r, l, 0x5, dst, OP_REG)); // SRL / SRA
                     }
                 }
                 self.writeback_if_spilled(&instr.operands[0], dst);
@@ -886,48 +893,52 @@ impl RiscvBackend {
             }
 
             IrOp::SaveCtx => {
-                // Save a fixed callee set + RA/SP into a named 40-byte buffer in DATA.
+                // Context layout (23 words = 92 bytes, 96 reserved):
+                //   [0..18] the 19 allocatable registers (PHYS_REGS order), [19] ra, [20] sp, [21] gp (return stack),
+                //   [22] resume address = the instruction right after this save sequence.
+                // Execution continues after save_ctx now, and again after any later restore_ctx of the same buffer.
                 if let Some(Operand::Label(name)) = instr.operands.first() {
-                    let base = if let Some(&b) = self.data_symbols.get(name) {
-                        b
-                    } else {
-                        let b = self.next_data;
-                        self.data_symbols.insert(name.clone(), b);
-                        self.next_data = b + 40;
-                        b
-                    };
-                    // s0,s1,s2..s7, ra, sp  (ABI-ish snapshot for cooperative IRQ stubs)
-                    let regs: &[u32] = &[8, 9, 18, 19, 20, 21, 22, 23, 1, 2];
-                    for (i, &r) in regs.iter().enumerate() {
-                        let addr = base + (i as u32 * 4);
-                        self.emit_li(T2, addr);
-                        self.emit(sw(r, T2, 0));
-                    }
+                    let base = self.ctx_base(name);
+                    self.emit_li(T2, base);
+                    for (i, &r) in PHYS_REGS.iter().enumerate() { self.emit(sw(r, T2, (i * 4) as i32)); }
+                    let n = PHYS_REGS.len() as i32;
+                    self.emit(sw(RA, T2, n * 4));
+                    self.emit(sw(SP, T2, (n + 1) * 4));
+                    self.emit(sw(GP, T2, (n + 2) * 4));
+                    self.emit(0x0000_0017 | (T1 << 7));          // auipc t1, 0
+                    self.emit(addi(T1, T1, 12));                  // t1 = address after the sw below
+                    self.emit(sw(T1, T2, (n + 3) * 4));
                 }
             }
 
             IrOp::RestoreCtx => {
+                // Switch to the context stored in the buffer: registers, ra, sp, gp, then jump to its resume address.
                 if let Some(Operand::Label(name)) = instr.operands.first() {
-                    let base = if let Some(&b) = self.data_symbols.get(name) {
-                        b
-                    } else {
-                        let b = self.next_data;
-                        self.data_symbols.insert(name.clone(), b);
-                        self.next_data = b + 40;
-                        b
-                    };
-                    let regs: &[u32] = &[8, 9, 18, 19, 20, 21, 22, 23, 1, 2];
-                    for (i, &r) in regs.iter().enumerate() {
-                        let addr = base + (i as u32 * 4);
-                        self.emit_li(T2, addr);
-                        self.emit(lw(r, T2, 0));
-                    }
-                    self.emit(jr(RA));
+                    let base = self.ctx_base(name);
+                    let n = PHYS_REGS.len() as i32;
+                    self.emit_li(T2, base);
+                    self.emit(lw(T1, T2, (n + 3) * 4));
+                    for (i, &r) in PHYS_REGS.iter().enumerate() { self.emit(lw(r, T2, (i * 4) as i32)); }
+                    self.emit(lw(RA, T2, n * 4));
+                    self.emit(lw(GP, T2, (n + 2) * 4));
+                    self.emit(lw(SP, T2, (n + 1) * 4));
+                    self.emit(jr(T1));
                 }
             }
 
             IrOp::Comment => {}
         }
+    }
+}
+
+impl RiscvBackend {
+    /// address of a context buffer: an existing data symbol (e.g. a user array of >= 23 words) or a new 96-byte slot
+    fn ctx_base(&mut self, name: &str) -> u32 {
+        if let Some(&b) = self.data_symbols.get(name) { return b; }
+        let b = self.next_data;
+        self.data_symbols.insert(name.to_string(), b);
+        self.next_data = b + 96;
+        b
     }
 }
 

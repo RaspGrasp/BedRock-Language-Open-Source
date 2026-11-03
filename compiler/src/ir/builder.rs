@@ -394,18 +394,22 @@ impl IrBuilder {
 
     /// Truncate/wrap to the declared width after writes (u8/u16/i8/i16).
     fn emit_narrow_trunc(&mut self, dst: &Operand, kind: &TypeKind, out: &mut IrModule) {
-        let mask = match kind {
-            TypeKind::U8 | TypeKind::I8 => Some(0xffu64),
-            TypeKind::U16 | TypeKind::I16 => Some(0xffffu64),
-            TypeKind::Bool => Some(0x1u64),
-            _ => None,
+        // unsigned narrow types: mask.  signed narrow types: sign-extend to 32 bits (shl, then arithmetic shr)
+        let (mask, sext) = match kind {
+            TypeKind::U8 => (Some(0xffu64), 0u64),
+            TypeKind::U16 => (Some(0xffffu64), 0),
+            TypeKind::Bool => (Some(1u64), 0),
+            TypeKind::I8 => (None, 24),
+            TypeKind::I16 => (None, 16),
+            _ => (None, 0),
         };
         if let Some(m) = mask {
-            out.push(IrInstr::and(
-                dst.clone(),
-                dst.clone(),
-                Operand::Imm(m),
-            ));
+            out.push(IrInstr::and(dst.clone(), dst.clone(), Operand::Imm(m)));
+        } else if sext != 0 {
+            out.push(IrInstr::shl(dst.clone(), dst.clone(), Operand::Imm(sext)));
+            let mut sr = IrInstr::shr(dst.clone(), dst.clone(), Operand::Imm(sext));
+            sr.operands.push(Operand::Imm(1)); // signed (arithmetic) shift
+            out.push(sr);
         }
     }
 
@@ -429,6 +433,8 @@ impl IrBuilder {
                 let l = self.snapshot(l, &[&**rhs], out);
                 let r = self.lower_expr(rhs, out);
                 let dest = self.fresh_vreg();
+                // signed (i*) operands select signed div/rem/arithmetic shift: marked by a 4th Imm(1) operand
+                let sg = matches!(op.as_str(), "/" | "%" | ">>") && (self.expr_signed(lhs) || (op != ">>" && self.expr_signed(rhs)));
                 let instr = match op.as_str() {
                     "+"  => IrInstr::add(dest.clone(), l, r),
                     "-"  => IrInstr::sub(dest.clone(), l, r),
@@ -449,6 +455,8 @@ impl IrBuilder {
                         return Operand::Imm(0);
                     }
                 };
+                let mut instr = instr;
+                if sg { instr.operands.push(Operand::Imm(1)); }
                 out.push(instr);
                 dest
             }

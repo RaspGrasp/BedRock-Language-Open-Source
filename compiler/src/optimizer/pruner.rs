@@ -104,6 +104,8 @@ _ => {}
                 used.insert(name.clone());
                 self.collect_used_in_expr(idx, used);
             }
+            Expression::AddressOf(name) => { used.insert(name.clone()); }
+            Expression::Syscall(args) => { for a in args { self.collect_used_in_expr(a, used); } }
             Expression::Peek(addr) => self.collect_used_in_expr(addr, used),
             Expression::Inb(port) => self.collect_used_in_expr(port, used),
             Expression::FieldAccess(var, _) => { used.insert(var.clone()); }
@@ -199,7 +201,18 @@ _ => {}
 
     fn set_const(&mut self, name: &str, folded: &Expression) {
         match folded {
-            Expression::Number(v, _) if self.locals.contains(name) => { self.constants.insert(name.to_string(), *v); }
+            Expression::Number(v, _) if self.locals.contains(name) => {
+                // narrow declared types wrap exactly like the IR builder's mask after let/assign
+                let w = match self.kinds.get(name) {
+                    Some(TypeKind::U8) => *v & 0xFF,
+                    Some(TypeKind::U16) => *v & 0xFFFF,
+                    Some(TypeKind::I8) => ((*v as u32 as i32) << 24 >> 24) as u32 as u64,
+                    Some(TypeKind::I16) => ((*v as u32 as i32) << 16 >> 16) as u32 as u64,
+                    Some(TypeKind::Bool) => *v & 1,
+                    _ => *v,
+                };
+                self.constants.insert(name.to_string(), w);
+            }
             _ => { self.constants.remove(name); }
         }
     }

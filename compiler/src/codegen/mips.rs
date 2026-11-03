@@ -473,7 +473,8 @@ IrOp::Rdf => {
                 let dst = self.dest_reg(&instr.operands[0]);
                 let l   = self.operand_to_reg(&instr.operands[1], 8);
                 let r   = self.operand_to_reg(&instr.operands[2], 9);
-                self.emit(0x0000001B | (l << 21) | (r << 16));  // DIVU
+                let dv = if instr.operands.len() > 3 { 0x1A } else { 0x1B }; // DIV / DIVU
+                self.emit(dv | (l << 21) | (r << 16));
                 self.emit(0x00000012 | (dst << 11));              // MFLO
                 self.writeback_if_spilled(&instr.operands[0], dst);
             }
@@ -483,7 +484,8 @@ IrOp::Rdf => {
                 let dst = self.dest_reg(&instr.operands[0]);
                 let l   = self.operand_to_reg(&instr.operands[1], 8);
                 let r   = self.operand_to_reg(&instr.operands[2], 9);
-                self.emit(0x0000001B | (l << 21) | (r << 16));  // DIVU
+                let dv = if instr.operands.len() > 3 { 0x1A } else { 0x1B }; // DIV / DIVU
+                self.emit(dv | (l << 21) | (r << 16));
                 self.emit(0x00000010 | (dst << 11));              // MFHI (remainder)
                 self.writeback_if_spilled(&instr.operands[0], dst);
             }
@@ -512,11 +514,13 @@ IrOp::Shr => {
     let op2 = instr.operands[2].clone();
     match op2 {
         Operand::Imm(sa) => {
-            self.emit(0x00000002 | (l << 16) | (dst << 11) | ((sa as u32 & 31) << 6));
+            let f = if instr.operands.len() > 3 { 0x03 } else { 0x02 }; // SRA / SRL
+            self.emit(f | (l << 16) | (dst << 11) | ((sa as u32 & 31) << 6));
         }
         _ => {
             let r = self.operand_to_reg(&op2, 9);
-            self.emit(0x00000006 | (r << 21) | (l << 16) | (dst << 11));
+            let f = if instr.operands.len() > 3 { 0x07 } else { 0x06 }; // SRAV / SRLV
+            self.emit(f | (r << 21) | (l << 16) | (dst << 11));
         }
     }
     self.writeback_if_spilled(&instr.operands[0], dst);

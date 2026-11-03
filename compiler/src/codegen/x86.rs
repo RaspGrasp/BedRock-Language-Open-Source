@@ -27,9 +27,10 @@ const R15: u8 = 15;
 
 /// Allocatable GPRs (avoid RSP/RBP; keep RAX/RDX as temps often)
 const PHYS_REGS: &[u8] = &[
-    RBX, R12, R13, R14, R15,
-    R8, R9, R10, R11,
-    RSI, RDI, RCX,
+    // RCX, R11 (operand/shift scratch) and R14, R15 (compare scratch) are NOT allocatable: codegen clobbers them
+    RBX, R12, R13,
+    R8, R9, R10,
+    RSI, RDI,
 ];
 
 const CF_L: u8 = R14;
@@ -321,6 +322,20 @@ impl X86Backend {
         self.modrm(3, 6, divisor); // /6 = DIV
     }
 
+    /// cqo ; idiv r/m64  (signed): quotient in rax, remainder in rdx
+    fn emit_idiv_rr(&mut self, divisor: u8) {
+        self.emit_u8(0x48);
+        self.emit_u8(0x99); // cqo
+        self.rex(true, 0, 0, divisor);
+        self.emit_u8(0xF7);
+        self.modrm(3, 7, divisor); // /7 = IDIV
+    }
+    fn emit_sar_cl(&mut self, dst: u8) {
+        self.rex(true, 0, 0, dst);
+        self.emit_u8(0xD3);
+        self.modrm(3, 7, dst); // /7 SAR
+    }
+
     fn emit_shl_cl(&mut self, dst: u8) {
         self.rex(true, 0, 0, dst);
         self.emit_u8(0xD3);
@@ -607,7 +622,7 @@ impl X86Backend {
                 let l = self.operand_to_reg(&instr.operands[1], R11);
                 let r = self.operand_to_reg(&instr.operands[2], RCX);
                 self.emit_mov_rr(RAX, l);
-                self.emit_div_rr(r);
+                if instr.operands.len() > 3 { self.emit_idiv_rr(r); } else { self.emit_div_rr(r); }
                 if matches!(instr.op, IrOp::Div) {
                     self.emit_mov_rr(dst, RAX);
                 } else {
@@ -626,7 +641,7 @@ impl X86Backend {
                 self.emit_mov_rr(RCX, r);
                 match instr.op {
                     IrOp::Shl => self.emit_shl_cl(dst),
-                    IrOp::Shr => self.emit_shr_cl(dst),
+                    IrOp::Shr => { if instr.operands.len() > 3 { self.emit_sar_cl(dst) } else { self.emit_shr_cl(dst) } }
                     _ => {}
                 }
                 self.writeback(&instr.operands[0], dst);
